@@ -103,13 +103,14 @@ def empacotamento_guloso(carregar: list, itens_dados: dict,
         lambda i: (_d(i)["peso"] > LIMITE_PESADO_G, _d(i)["z"]),
     )
 
-    melhor = None
+    melhor_vol = -1
+    melhor_posicoes: dict = {}
+    melhor_fora: list = list(carregar)
     for chave in ordens:
         posicoes, fora = _empacotar(
             sorted(carregar, key=chave, reverse=True), itens_dados, C_cx, C_cy, C_cz
         )
         vol = sum(itens_dados[i]["volume"] for i in posicoes)
-        if melhor is None or vol > melhor[0]:
-            melhor = (vol, posicoes, fora)
-    _, posicoes, fora = melhor
-    return posicoes, fora
+        if vol > melhor_vol:
+            melhor_vol, melhor_posicoes, melhor_fora = vol, posicoes, fora
+    return melhor_posicoes, melhor_fora
