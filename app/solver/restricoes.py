@@ -30,6 +30,20 @@ def restricao_pesados_no_chao(
     return penalidades
 
 
+def _pode_apoiar(dim_a: dict, dim_b: dict) -> bool:
+    """
+    Poda: `a` só é candidato a apoiar `b` se em alguma combinação de rotações
+    a sobreposição máxima possível (limitada pelo menor dos dois) atingir 80%
+    da base de `b` em ambos os eixos. Evita criar variáveis para pares
+    fisicamente impossíveis (ex.: caixa pequena apoiando caixa grande).
+    """
+    for ax, ay in ((dim_a["x"], dim_a["y"]), (dim_a["y"], dim_a["x"])):
+        for bx, by in ((dim_b["x"], dim_b["y"]), (dim_b["y"], dim_b["x"])):
+            if 10 * min(ax, bx) >= 8 * bx and 10 * min(ay, by) >= 8 * by:
+                return True
+    return False
+
+
 def restricao_apoio(
     model: cp_model.CpModel,
     carregar: list,
@@ -38,23 +52,45 @@ def restricao_apoio(
     zi: dict, zf: dict,
     ddx: dict, ddy: dict,
     C_cx: int, C_cy: int,
+    itens_dados: dict | None = None,
 ) -> None:
     """
-    Restrição de apoio: 80% da base deve estar suportada.
+    Restrição de apoio: 80% da base (face inferior) deve estar suportada.
 
-    Para cada par (a, b), quando o item `a` está diretamente sob `b`
-    (`zf[a] == zi[b]`), a sobreposição em XY entre os dois deve cobrir
+    Todo item `b` deve estar no chão (`zi[b] == 0`) OU apoiado sobre um item
+    `a` imediatamente abaixo (`zf[a] == zi[b]`) cuja sobreposição em XY cubra
     pelo menos 80% da base de `b` em cada eixo (10*ov >= 8*dd).
+
+    Apenas a face inferior conta como apoio — contato lateral ou superior
+    não sustenta o item. A disjunção `add_bool_or` obriga o solver a escolher
+    um apoio válido (ou o chão) para cada item; sem ela os booleanos ficariam
+    livres e itens poderiam flutuar.
+
+    `itens_dados` (opcional) habilita a poda de pares impossíveis: pares onde
+    `a` nunca alcançaria 80% da base de `b` não geram variáveis.
     """
     n = len(carregar)
-    for ii in range(n):
-        for jj in range(n):
+    for jj in range(n):
+        b = carregar[jj]
+        apoios = []
+
+        # Alternativa 1: item está no chão
+        no_chao = model.new_bool_var(f'no_chao_{jj}')
+        model.add(zi[b] == 0).only_enforce_if(no_chao)
+        apoios.append(no_chao)
+
+        # Alternativa 2: algum item `a` apoia a base de `b` em >= 80%
+        for ii in range(n):
             if ii == jj:
                 continue
-            a, b = carregar[ii], carregar[jj]
+            a = carregar[ii]
 
-            a_sob_b = model.new_bool_var(f'sob_{ii}_{jj}')
-            model.add(zf[a] == zi[b]).only_enforce_if(a_sob_b)
+            if itens_dados is not None and not _pode_apoiar(itens_dados[a], itens_dados[b]):
+                continue
+
+            suporte = model.new_bool_var(f'sob_{ii}_{jj}')
+            # `a` imediatamente abaixo de `b` (topo de `a` no nível da base de `b`)
+            model.add(zf[a] == zi[b]).only_enforce_if(suporte)
 
             mxf = model.new_int_var(0, C_cx,     f'mxf_{ii}_{jj}')
             Mxi = model.new_int_var(0, C_cx,     f'Mxi_{ii}_{jj}')
@@ -70,8 +106,13 @@ def restricao_apoio(
             model.add_max_equality(Myi, [yi[a], yi[b]])
             model.add(ovy == myf - Myi)
 
-            model.add(10 * ovx >= 8 * ddx[b]).only_enforce_if(a_sob_b)
-            model.add(10 * ovy >= 8 * ddy[b]).only_enforce_if(a_sob_b)
+            model.add(10 * ovx >= 8 * ddx[b]).only_enforce_if(suporte)
+            model.add(10 * ovy >= 8 * ddy[b]).only_enforce_if(suporte)
+
+            apoios.append(suporte)
+
+        # `b` precisa de pelo menos uma alternativa de apoio válida
+        model.add_bool_or(apoios)
 
 
 def restricao_nao_sobreposicao(

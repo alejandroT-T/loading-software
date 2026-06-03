@@ -1,5 +1,6 @@
 from ortools.sat.python import cp_model
 from app.data.conteiners import Conteiner
+from app.solver.heuristica import empacotamento_guloso
 from app.solver.restricoes import (
     restricao_pesados_no_chao,
     restricao_apoio,
@@ -36,15 +37,33 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
 
     restringir_ao_meio = vol_total * 2 <= vol_max
 
+    # ═══ FASE 1.5 — Heurística gulosa: solução viável inicial (warm start) ════
+    # O CP-SAT sozinho não encontra a primeira solução com apoio obrigatório em
+    # tempo hábil. O guloso posiciona o que cabe; o que não couber é reportado
+    # como não carregado, e o CP-SAT parte da solução gulosa para compactar.
+    x_limite = meio if restringir_ao_meio else C_cx
+    posicoes, fora_geometria = empacotamento_guloso(carregar, itens_dados, x_limite, C_cy, C_cz)
+    if not posicoes:
+        print("❌ Fase 1.5: heurística não posicionou nenhum item.")
+        return None, None
+    if fora_geometria:
+        print(f"⚠️  Fase 1.5: {len(fora_geometria)} item(ns) sem posição válida "
+              f"(sem espaço com apoio de 80%) — ficarão fora do carregamento.")
+    carregar   = [i for i in carregar if i in posicoes]
+    vol_total  = sum(itens_dados[i]["volume"] for i in carregar)
+    peso_total = sum(itens_dados[i]["peso"]   for i in carregar)
+
     # ═══ FASE 2 — Posicionar do fundo (X=0) para frente, compactando ao fundo ═
     m2 = cp_model.CpModel()
     xi, yi, zi = {}, {}, {}
     xf, yf, zf = {}, {}, {}
     ddx, ddy   = {}, {}
+    giros      = {}
 
     for item in carregar:
         dim  = itens_dados[item]
         giro = m2.new_bool_var(f'g_{item}')
+        giros[item] = giro
 
         ddx[item] = m2.new_int_var(0, C_cx, f'dx_{item}')
         ddy[item] = m2.new_int_var(0, C_cy, f'dy_{item}')
@@ -76,7 +95,8 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
     penalidades_chao = restricao_pesados_no_chao(m2, carregar, itens_dados, zi)  # lista de (nome, chao_boolvar)
 
     # ── Restrição de apoio: 80% da base deve estar suportada ─────────────────
-    restricao_apoio(m2, carregar, xi, xf, yi, yf, zi, zf, ddx, ddy, C_cx, C_cy)
+    restricao_apoio(m2, carregar, xi, xf, yi, yf, zi, zf, ddx, ddy, C_cx, C_cy,
+                    itens_dados=itens_dados)
 
     # ── Não-sobreposição ──────────────────────────────────────────────────────
     restricao_nao_sobreposicao(m2, carregar, xi, xf, yi, yf, zi, zf)
@@ -89,8 +109,17 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
     penalidade_total = sum(C_cz * bv for _, bv in penalidades_chao)
     m2.minimize(x_max + penalidade_total)
 
+    # Warm start: o CP-SAT parte da solução gulosa e usa o tempo para melhorá-la
+    for item in carregar:
+        p = posicoes[item]
+        m2.add_hint(xi[item], p["x"])
+        m2.add_hint(yi[item], p["y"])
+        m2.add_hint(zi[item], p["z"])
+        m2.add_hint(giros[item], int(p["girado"]))
+
     s2 = cp_model.CpSolver()
     s2.parameters.max_time_in_seconds = 60.0
+    s2.parameters.num_workers = 8
     status2 = s2.solve(m2)
 
     if status2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
