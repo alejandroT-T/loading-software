@@ -1,6 +1,10 @@
 from ortools.sat.python import cp_model
 from app.data.conteiners import Conteiner
-from app.solver.restricoes import restricao_pesados_no_chao
+from app.solver.restricoes import (
+    restricao_pesados_no_chao,
+    restricao_apoio,
+    restricao_nao_sobreposicao,
+)
 
 
 def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
@@ -14,19 +18,19 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
 
     # ═══ FASE 1 — Selecionar quais itens cabem (maximizar volume) ══════════════
     m1   = cp_model.CpModel()
-    rest = {i: m1.NewBoolVar(f'r_{i}') for i in nomes_itens}
+    rest = {i: m1.new_bool_var(f'r_{i}') for i in nomes_itens}
 
-    m1.Add(sum(rest[i] * int(itens_dados[i]["peso"])   for i in nomes_itens) <= peso_max)
-    m1.Add(sum(rest[i] * int(itens_dados[i]["volume"]) for i in nomes_itens) <= vol_max)
-    m1.Maximize(sum(rest[i] * itens_dados[i]["volume"] for i in nomes_itens))
+    m1.add(sum(rest[i] * int(itens_dados[i]["peso"])   for i in nomes_itens) <= peso_max)
+    m1.add(sum(rest[i] * int(itens_dados[i]["volume"]) for i in nomes_itens) <= vol_max)
+    m1.maximize(sum(rest[i] * itens_dados[i]["volume"] for i in nomes_itens))
 
     s1 = cp_model.CpSolver()
     s1.parameters.max_time_in_seconds = 1800.0
-    if s1.Solve(m1) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+    if s1.solve(m1) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("❌ Fase 1: nenhuma solução viável.")
         return None, None
 
-    carregar   = [i for i in nomes_itens if s1.Value(rest[i]) == 1]
+    carregar   = [i for i in nomes_itens if s1.value(rest[i]) == 1]
     vol_total  = sum(itens_dados[i]["volume"] for i in carregar)
     peso_total = sum(itens_dados[i]["peso"]   for i in carregar)
 
@@ -40,97 +44,62 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
 
     for item in carregar:
         dim  = itens_dados[item]
-        giro = m2.NewBoolVar(f'g_{item}')
+        giro = m2.new_bool_var(f'g_{item}')
 
-        ddx[item] = m2.NewIntVar(0, C_cx, f'dx_{item}')
-        ddy[item] = m2.NewIntVar(0, C_cy, f'dy_{item}')
-        m2.Add(ddx[item] == dim["x"]).OnlyEnforceIf(giro.Not())
-        m2.Add(ddy[item] == dim["y"]).OnlyEnforceIf(giro.Not())
-        m2.Add(ddx[item] == dim["y"]).OnlyEnforceIf(giro)
-        m2.Add(ddy[item] == dim["x"]).OnlyEnforceIf(giro)
+        ddx[item] = m2.new_int_var(0, C_cx, f'dx_{item}')
+        ddy[item] = m2.new_int_var(0, C_cy, f'dy_{item}')
+        m2.add(ddx[item] == dim["x"]).only_enforce_if(giro.negated())
+        m2.add(ddy[item] == dim["y"]).only_enforce_if(giro.negated())
+        m2.add(ddx[item] == dim["y"]).only_enforce_if(giro)
+        m2.add(ddy[item] == dim["x"]).only_enforce_if(giro)
 
-        xi[item] = m2.NewIntVar(0, C_cx, f'xi_{item}')
-        yi[item] = m2.NewIntVar(0, C_cy, f'yi_{item}')
-        zi[item] = m2.NewIntVar(0, C_cz, f'zi_{item}')
-        xf[item] = m2.NewIntVar(0, C_cx, f'xf_{item}')
-        yf[item] = m2.NewIntVar(0, C_cy, f'yf_{item}')
-        zf[item] = m2.NewIntVar(0, C_cz, f'zf_{item}')
+        xi[item] = m2.new_int_var(0, C_cx, f'xi_{item}')
+        yi[item] = m2.new_int_var(0, C_cy, f'yi_{item}')
+        zi[item] = m2.new_int_var(0, C_cz, f'zi_{item}')
+        xf[item] = m2.new_int_var(0, C_cx, f'xf_{item}')
+        yf[item] = m2.new_int_var(0, C_cy, f'yf_{item}')
+        zf[item] = m2.new_int_var(0, C_cz, f'zf_{item}')
 
-        m2.Add(xf[item] == xi[item] + ddx[item])
-        m2.Add(yf[item] == yi[item] + ddy[item])
-        m2.Add(zf[item] == zi[item] + dim["z"])
+        m2.add(xf[item] == xi[item] + ddx[item])
+        m2.add(yf[item] == yi[item] + ddy[item])
+        m2.add(zf[item] == zi[item] + dim["z"])
 
-        m2.Add(xf[item] <= C_cx)
-        m2.Add(yf[item] <= C_cy)
-        m2.Add(zf[item] <= C_cz)
+        m2.add(xf[item] <= C_cx)
+        m2.add(yf[item] <= C_cy)
+        m2.add(zf[item] <= C_cz)
 
         if restringir_ao_meio:
-            m2.Add(xf[item] <= meio)
+            m2.add(xf[item] <= meio)
 
     # ── Restrição suave: pesados (>80 kg) devem ficar no chão ────────────────
     # Penalidade = C_cz por item fora do chão, somada ao objetivo de Minimize(x_max)
     penalidades_chao = restricao_pesados_no_chao(m2, carregar, itens_dados, zi)  # lista de (nome, chao_boolvar)
 
-    # ── Restrição de apoio: 60% da base deve estar suportada ─────────────────
-    n = len(carregar)
-    for ii in range(n):
-        for jj in range(n):
-            if ii == jj:
-                continue
-            a, b = carregar[ii], carregar[jj]
-
-            a_sob_b = m2.NewBoolVar(f'sob_{ii}_{jj}')
-            m2.Add(zf[a] == zi[b]).OnlyEnforceIf(a_sob_b)
-
-            mxf = m2.NewIntVar(0, C_cx,     f'mxf_{ii}_{jj}')
-            Mxi = m2.NewIntVar(0, C_cx,     f'Mxi_{ii}_{jj}')
-            ovx = m2.NewIntVar(-C_cx, C_cx, f'ovx_{ii}_{jj}')
-            m2.AddMinEquality(mxf, [xf[a], xf[b]])
-            m2.AddMaxEquality(Mxi, [xi[a], xi[b]])
-            m2.Add(ovx == mxf - Mxi)
-
-            myf = m2.NewIntVar(0, C_cy,     f'myf_{ii}_{jj}')
-            Myi = m2.NewIntVar(0, C_cy,     f'Myi_{ii}_{jj}')
-            ovy = m2.NewIntVar(-C_cy, C_cy, f'ovy_{ii}_{jj}')
-            m2.AddMinEquality(myf, [yf[a], yf[b]])
-            m2.AddMaxEquality(Myi, [yi[a], yi[b]])
-            m2.Add(ovy == myf - Myi)
-
-            m2.Add(10 * ovx >= 6 * ddx[b]).OnlyEnforceIf(a_sob_b)
-            m2.Add(10 * ovy >= 6 * ddy[b]).OnlyEnforceIf(a_sob_b)
+    # ── Restrição de apoio: 80% da base deve estar suportada ─────────────────
+    restricao_apoio(m2, carregar, xi, xf, yi, yf, zi, zf, ddx, ddy, C_cx, C_cy)
 
     # ── Não-sobreposição ──────────────────────────────────────────────────────
-    for ii in range(n):
-        for jj in range(ii + 1, n):
-            a, b = carregar[ii], carregar[jj]
-            s = [m2.NewBoolVar(f'sep_{ii}_{jj}_{k}') for k in range(6)]
-            m2.Add(xf[a] <= xi[b]).OnlyEnforceIf(s[0])
-            m2.Add(xi[a] >= xf[b]).OnlyEnforceIf(s[1])
-            m2.Add(yf[a] <= yi[b]).OnlyEnforceIf(s[2])
-            m2.Add(yi[a] >= yf[b]).OnlyEnforceIf(s[3])
-            m2.Add(zf[a] <= zi[b]).OnlyEnforceIf(s[4])
-            m2.Add(zi[a] >= zf[b]).OnlyEnforceIf(s[5])
-            m2.AddBoolOr(s)
+    restricao_nao_sobreposicao(m2, carregar, xi, xf, yi, yf, zi, zf)
 
-    x_max = m2.NewIntVar(0, C_cx, 'x_max')
+    x_max = m2.new_int_var(0, C_cx, 'x_max')
     for item in carregar:
-        m2.Add(x_max >= xf[item])
+        m2.add(x_max >= xf[item])
 
     # Penalidade por item pesado fora do chão: cada violação custa C_cz cm no objetivo
     penalidade_total = sum(C_cz * bv for _, bv in penalidades_chao)
-    m2.Minimize(x_max + penalidade_total)
+    m2.minimize(x_max + penalidade_total)
 
     s2 = cp_model.CpSolver()
     s2.parameters.max_time_in_seconds = 60.0
-    status2 = s2.Solve(m2)
+    status2 = s2.solve(m2)
 
     if status2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("❌ Fase 2: não foi possível posicionar os itens.")
         return None, None
 
-    avanco = s2.Value(x_max)
+    avanco = s2.value(x_max)
 
-    pesados_fora_chao = [nome for nome, bv in penalidades_chao if s2.Value(bv) == 1]
+    pesados_fora_chao = [nome for nome, bv in penalidades_chao if s2.value(bv) == 1]
 
     print("=" * 60)
     print("   MAPA DE CARREGAMENTO 3D — FUNDO PARA FRENTE (COM APOIO)   ")
@@ -152,10 +121,10 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
 
     lista_carregamento = []
     for item in carregar:
-        _xi = s2.Value(xi[item]); _xf = s2.Value(xf[item])
-        _yi = s2.Value(yi[item]); _yf = s2.Value(yf[item])
-        _zi = s2.Value(zi[item]); _zf = s2.Value(zf[item])
-        _dx = s2.Value(ddx[item]); _dy = s2.Value(ddy[item])
+        _xi = s2.value(xi[item]); _xf = s2.value(xf[item])
+        _yi = s2.value(yi[item]); _yf = s2.value(yf[item])
+        _zi = s2.value(zi[item]); _zf = s2.value(zf[item])
+        _dx = s2.value(ddx[item]); _dy = s2.value(ddy[item])
         girado = "Sim (90°)" if _dx != itens_dados[item]["x"] else "Não"
         lista_carregamento.append({
             "nome":  item,

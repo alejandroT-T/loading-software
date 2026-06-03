@@ -4,46 +4,65 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Software de simulação de carga em contêiner. Dado um conjunto de itens de móveis em uma planilha XLSX, seleciona quais cabem num contêiner e calcula o posicionamento 3D exato de cada um, exibindo o resultado em visualização interativa 3D.
+Software de simulação de carga em contêiner. Dado um conjunto de itens de móveis em uma planilha XLSX, seleciona quais cabem num contêiner e calcula o posicionamento 3D exato de cada um (solver CP-SAT do OR-Tools), exibindo o resultado em visualização 3D interativa (PyVista).
 
+Este backend também é consumido pelo repositório vizinho **`front-loading-software`** (mesmo diretório pai), que importa `app.data` e `app.solver` diretamente via `sys.path` e serve um front web (FastAPI + Three.js). Mudanças na assinatura de `resolver_carregamento`, `carregar_itens`, `CONTEINERES` ou `LIMITE_PESADO_G` afetam o front.
 
 Não há testes ou configuração de linting no momento.
 
+## Ambiente
+
+- Venv do projeto: `.venv/` (Python 3.11). Use `.venv\Scripts\python.exe` — o Python global da máquina **não** tem as dependências (ortools, pandas, pyvista, fastapi).
+- Rodar a versão desktop: `.venv\Scripts\python.exe -m app.main` (a partir da raiz do repo).
+- O console do Windows (charmap) não suporta os emojis dos `print()`; use `-X utf8` se necessário.
+
+### API do OR-Tools: snake_case obrigatório
+
+O venv usa **ortools 9.15**. Todo o código foi migrado para a API snake_case (`new_bool_var`, `add`, `only_enforce_if`, `add_min_equality`, `solve`, `value`, `.negated()`...). **Não use** a API CamelCase antiga (`NewBoolVar`, `Add`, `OnlyEnforceIf`, `.Not()`...): ela ainda funciona em runtime como alias deprecado, mas é gerada dinamicamente e o Pylance marca erro "Attribute unknown" em todos os usos.
+
 ## Architecture
 
-### Two-phase CP-SAT solver (`app/main.py`)
+```
+app/
+├── main.py                  # orquestra: carregar_itens → resolver_carregamento → visualizar_carregamento
+├── data/
+│   ├── conteiners.py        # dataclass Conteiner + CONTEINERES (4 padrão) + conteiner_personalizado()
+│   └── modelos.py           # carregar_itens(xlsx) → dict {nome: {x,y,z,peso,volume}}
+├── solver/
+│   ├── solver.py            # resolver_carregamento(): solver CP-SAT em 2 fases
+│   └── restricoes.py        # restrições reutilizáveis + LIMITE_PESADO_G
+└── interface/
+    └── visualizacao.py      # visualizar_carregamento(): cena PyVista (uso desktop; o front web usa Three.js)
+```
 
-Toda a lógica está em `simular_empacotamento_3d_real()`:
+### Two-phase CP-SAT solver (`app/solver/solver.py`)
 
-**Fase 1 — seleção de itens** (limite de 20s): Cria um modelo CP-SAT com uma variável booleana por item. Maximiza volume total sujeito a peso ≤ 28.600 kg e volume ≤ 76.000.000 cm³. Produz o subconjunto `carregar`.
+`resolver_carregamento(conteiner, itens_dados) -> (lista_carregamento, itens_dados)` (retorna `(None, None)` se inviável):
 
-**Fase 2 — posicionamento 3D** (limite de 60s): Para cada item selecionado, cria variáveis inteiras para origem (`xi/yi/zi`) e fim (`xf/yf/zf`), mais um booleano de rotação (`giro`) que troca as dimensões X e Y. Restrições:
-- Itens dentro dos limites do contêiner (1203 × 235 × 269 cm)
-- Não-sobreposição via disjunção de 6 separadores booleanos por par
-- Apoio estrutural: quando item `a` está diretamente sob `b` (`zf[a] == zi[b]`), a sobreposição em XY deve cobrir ≥ 60% da base de `b`
-- Se volume total selecionado ≤ metade do contêiner, restringe todos os itens à metade traseira (`xf ≤ 601`)
+**Fase 1 — seleção de itens** (limite 1800s): uma BoolVar por item; maximiza volume total sujeito a peso ≤ `peso_max` e volume ≤ `vol_max` do contêiner. Produz o subconjunto `carregar`.
 
-Objetivo: minimizar `x_max` (avanço máximo em X), compactando a carga em direção ao fundo (X = 0).
+**Fase 2 — posicionamento 3D** (limite 60s): para cada item, IntVars de origem (`xi/yi/zi`) e fim (`xf/yf/zf`) + BoolVar `giro` que troca as dimensões X↔Y. Restrições (as três últimas em `restricoes.py`):
+- Item dentro dos limites do contêiner
+- Se o volume selecionado ≤ metade do contêiner, restringe tudo à metade traseira (`xf ≤ cx/2`)
+- `restricao_pesados_no_chao` — **suave**: itens > 80 kg (`LIMITE_PESADO_G = 80_000` g) preferem o chão (`zi == 0`); cada violação adiciona `C_cz` ao objetivo
+- `restricao_apoio` — quando `a` está diretamente sob `b` (`zf[a] == zi[b]`), a sobreposição XY deve cobrir **≥ 80%** da base de `b` em cada eixo (`10*ov >= 8*dd`)
+- `restricao_nao_sobreposicao` — disjunção de 6 separadores booleanos por par
+
+Objetivo: `Minimize(x_max + penalidade_pesados)` — compacta a carga em direção ao fundo (X = 0).
+
+Cada entrada de `lista_carregamento`: `{nome, st_x, end_x, st_y, end_y, st_z, end_z, dx, dy, girado}` — `girado` é string `"Sim (90°)"` ou `"Não"`, ordenada por `st_x`.
 
 ### Convenções de unidades
 
-O solver CP-SAT exige inteiros, então todos os valores são convertidos na leitura:
-- Dimensões: metros × 100 → centímetros
-- Peso: kg × 1000 → gramas
-- Volume: m³ × 1.000.000 → cm³
+O CP-SAT exige inteiros; tudo é convertido na leitura (`modelos.py`):
+- Dimensões: metros × 100 → **centímetros**
+- Peso: kg × 1000 → **gramas**
+- Volume: m³ × 1.000.000 → **cm³**
 
-Nomes de itens duplicados recebem sufixos `_2`, `_3`, …
+### Dados de entrada (`data_load/`)
 
-### Data files
+Planilha ativa definida em `app/main.py` (`CAMINHO_XLSX`, hoje `data_items_ajustada.xlsx`). Colunas: `ITEM`, `qtd` (opcional), `peso` (kg), `comprimento` (X), `profundidade` (Y), `altura` (Z), `volume`. Com coluna `qtd`, cada linha expande em N cópias `nome_1..nome_N`; sem ela, duplicatas ganham sufixo `_2`, `_3`, ….
 
-Os dados de entrada ficam em `data_load/`. O arquivo ativo é `data_items_sem_qtd.xlsx` (caminho fixo em `main.py` linha 8). Para usar outro dataset, altere o nome do arquivo lá. As colunas do Excel são: `ITEM`, `peso` (kg), `comprimento` (X), `profundidade` (Y), `altura` (Z), `volume`.
+### Contêineres (`app/data/conteiners.py`)
 
-### Módulos planejados (atualmente placeholders vazios)
-
-| Pasta/arquivo | Intenção |
-|---|---|
-| `app/data/conteiners.py` | Modelos com dimensões dos 4 contêineres padrão + dimensão personalizada |
-| `app/solver/solver.py` | Lógica do solver extraída de `main.py` |
-| `app/interface/` | Visualização PyVista separada de `main.py` |
-
-`app/data/modelos.py` duplica a função `carregar_itens()` de `main.py` e imprime os itens como JSON; não é importado por `main.py`.
+`CONTEINERES`: `20ft`, `40ft`, `40hc` (padrão do `main.py`), `45hc`. `conteiner_personalizado(cx, cy, cz, peso_max_kg, vol_max_m3)` converte para as unidades internas.
