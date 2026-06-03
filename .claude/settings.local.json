@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\alejandro.taborda\\\\DEV\\\\EMPACOTAMENTO\\\\loading-software\" -Force)",
+      "Bash(Select-Object Name, PSIsContainer)",
+      "Bash(Format-Table -AutoSize)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\alejandro.taborda\\\\DEV\\\\EMPACOTAMENTO\\\\loading-software\" -Force | Where-Object { $_.Name -ne '.venv' -and $_.Name -ne '.backup' })",
+      "Bash(python3 *)"
+    ]
+  }
+}
