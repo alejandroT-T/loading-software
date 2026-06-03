@@ -1,6 +1,6 @@
 .venv/
-__pychace__/
+__pycache__/
 *.pyc
 *.pyo
 .backup/
-"@ | Out-File -Encoding utf8 .gitignore
+data_load/
