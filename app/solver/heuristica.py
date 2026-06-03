@@ -29,64 +29,81 @@ def _apoio_ok(colocados: list, x1: int, y1: int, z1: int, dx: int, dy: int) -> b
     return False
 
 
-def _empacotar(ordem: list, itens_dados: dict, C_cx: int, C_cy: int, C_cz: int) -> tuple:
-    """Guloso first-fit: varre candidatos em (z, x, y) ascendente — chão e fundo
-    primeiro. Item sem posição válida é pulado (vai para `fora`)."""
-    colocados, posicoes, fora = [], {}, []
-    for item in ordem:
-        dim = itens_dados[item]
-        # Grade de candidatos: origem + bordas dos itens já colocados
-        zs = sorted({0} | {p["z2"] for p in colocados})
-        xs = sorted({0} | {p["x1"] for p in colocados} | {p["x2"] for p in colocados})
-        ys = sorted({0} | {p["y1"] for p in colocados} | {p["y2"] for p in colocados})
-        melhor = None
-        for dx, dy, girado in ((dim["x"], dim["y"], False), (dim["y"], dim["x"], True)):
-            if dx > C_cx or dy > C_cy or dim["z"] > C_cz:
+def _tentar_colocar(item: str, itens_dados: dict, colocados: list, posicoes: dict,
+                    C_cx: int, C_cy: int, C_cz: int) -> bool:
+    """Tenta posicionar um item (first-fit em (z, x, y) ascendente — chão e
+    fundo primeiro). Se couber, registra em `colocados`/`posicoes` e retorna True."""
+    dim = itens_dados[item]
+    # Grade de candidatos: origem + bordas dos itens já colocados
+    zs = sorted({0} | {p["z2"] for p in colocados})
+    xs = sorted({0} | {p["x1"] for p in colocados} | {p["x2"] for p in colocados})
+    ys = sorted({0} | {p["y1"] for p in colocados} | {p["y2"] for p in colocados})
+    melhor = None
+    for dx, dy, girado in ((dim["x"], dim["y"], False), (dim["y"], dim["x"], True)):
+        if dx > C_cx or dy > C_cy or dim["z"] > C_cz:
+            continue
+        achou = None
+        for cz0 in zs:
+            if cz0 + dim["z"] > C_cz:
                 continue
-            achou = None
-            for cz0 in zs:
-                if cz0 + dim["z"] > C_cz:
+            for cx0 in xs:
+                if cx0 + dx > C_cx:
                     continue
-                for cx0 in xs:
-                    if cx0 + dx > C_cx:
+                for cy0 in ys:
+                    if cy0 + dy > C_cy:
                         continue
-                    for cy0 in ys:
-                        if cy0 + dy > C_cy:
-                            continue
-                        x2, y2, z2 = cx0 + dx, cy0 + dy, cz0 + dim["z"]
-                        if any(_sobrepoe(p, cx0, cy0, cz0, x2, y2, z2) for p in colocados):
-                            continue
-                        if not _apoio_ok(colocados, cx0, cy0, cz0, dx, dy):
-                            continue
-                        achou = (cx0, cy0, cz0)
-                        break
-                    if achou:
-                        break
+                    x2, y2, z2 = cx0 + dx, cy0 + dy, cz0 + dim["z"]
+                    if any(_sobrepoe(p, cx0, cy0, cz0, x2, y2, z2) for p in colocados):
+                        continue
+                    if not _apoio_ok(colocados, cx0, cy0, cz0, dx, dy):
+                        continue
+                    achou = (cx0, cy0, cz0)
+                    break
                 if achou:
                     break
             if achou:
-                cx0, cy0, cz0 = achou
-                pesado_alto = dim["peso"] > LIMITE_PESADO_G and cz0 > 0
-                score = (pesado_alto, cz0, cx0 + dx, cy0)
-                if melhor is None or score < melhor[0]:
-                    melhor = (score, cx0, cy0, cz0, dx, dy, girado)
-        if melhor is None:
+                break
+        if achou:
+            cx0, cy0, cz0 = achou
+            pesado_alto = dim["peso"] > LIMITE_PESADO_G and cz0 > 0
+            score = (pesado_alto, cz0, cx0 + dx, cy0)
+            if melhor is None or score < melhor[0]:
+                melhor = (score, cx0, cy0, cz0, dx, dy, girado)
+    if melhor is None:
+        return False
+    _, cx0, cy0, cz0, dx, dy, girado = melhor
+    colocados.append({
+        "nome": item,
+        "x1": cx0, "y1": cy0, "z1": cz0,
+        "x2": cx0 + dx, "y2": cy0 + dy, "z2": cz0 + dim["z"],
+    })
+    posicoes[item] = {"x": cx0, "y": cy0, "z": cz0, "dx": dx, "dy": dy, "girado": girado}
+    return True
+
+
+def _empacotar(ordem: list, itens_dados: dict, C_cx: int, C_cy: int, C_cz: int) -> tuple:
+    """Guloso first-fit: posiciona cada item na ordem dada; quem não couber vai
+    para `fora`. Depois, passadas de reinserção: superfícies criadas por itens
+    posteriores podem viabilizar quem falhou cedo (ex.: faltava apoio). Repete
+    enquanto houver progresso."""
+    colocados, posicoes, fora = [], {}, []
+    for item in ordem:
+        if not _tentar_colocar(item, itens_dados, colocados, posicoes, C_cx, C_cy, C_cz):
             fora.append(item)
-            continue
-        _, cx0, cy0, cz0, dx, dy, girado = melhor
-        colocados.append({
-            "nome": item,
-            "x1": cx0, "y1": cy0, "z1": cz0,
-            "x2": cx0 + dx, "y2": cy0 + dy, "z2": cz0 + dim["z"],
-        })
-        posicoes[item] = {"x": cx0, "y": cy0, "z": cz0, "dx": dx, "dy": dy, "girado": girado}
+    progrediu = True
+    while progrediu and fora:
+        restantes = [i for i in fora
+                     if not _tentar_colocar(i, itens_dados, colocados, posicoes, C_cx, C_cy, C_cz)]
+        progrediu = len(restantes) < len(fora)
+        fora = restantes
     return posicoes, fora
 
 
 def empacotamento_guloso(carregar: list, itens_dados: dict,
                          C_cx: int, C_cy: int, C_cz: int) -> tuple:
     """
-    Testa um portfólio de ordenações e devolve a melhor por volume carregado.
+    Testa um portfólio de ordenações e devolve a melhor por número de itens
+    carregados (volume como desempate).
 
     Retorna `(posicoes, fora)`:
     - posicoes: {item: {x, y, z, dx, dy, girado}} — solução viável (warm start)
@@ -103,7 +120,7 @@ def empacotamento_guloso(carregar: list, itens_dados: dict,
         lambda i: (_d(i)["peso"] > LIMITE_PESADO_G, _d(i)["z"]),
     )
 
-    melhor_vol = -1
+    melhor_score = (-1, -1)
     melhor_posicoes: dict = {}
     melhor_fora: list = list(carregar)
     for chave in ordens:
@@ -111,6 +128,6 @@ def empacotamento_guloso(carregar: list, itens_dados: dict,
             sorted(carregar, key=chave, reverse=True), itens_dados, C_cx, C_cy, C_cz
         )
         vol = sum(itens_dados[i]["volume"] for i in posicoes)
-        if vol > melhor_vol:
-            melhor_vol, melhor_posicoes, melhor_fora = vol, posicoes, fora
+        if (len(posicoes), vol) > melhor_score:
+            melhor_score, melhor_posicoes, melhor_fora = (len(posicoes), vol), posicoes, fora
     return melhor_posicoes, melhor_fora
