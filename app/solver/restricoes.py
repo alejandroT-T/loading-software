@@ -3,6 +3,10 @@ from ortools.sat.python import cp_model
 # Limite em gramas (pesos são armazenados como kg * 1000)
 LIMITE_PESADO_G = 80_000  # 80 kg
 
+# Fração mínima da base que deve estar apoiada, em % (usada como
+# 100*ov >= APOIO_MIN_PCT*dd para manter a aritmética inteira do CP-SAT)
+APOIO_MIN_PCT = 60
+
 
 def restricao_pesados_no_chao(
     model: cp_model.CpModel,
@@ -33,13 +37,14 @@ def restricao_pesados_no_chao(
 def _pode_apoiar(dim_a: dict, dim_b: dict) -> bool:
     """
     Poda: `a` só é candidato a apoiar `b` se em alguma combinação de rotações
-    a sobreposição máxima possível (limitada pelo menor dos dois) atingir 80%
-    da base de `b` em ambos os eixos. Evita criar variáveis para pares
-    fisicamente impossíveis (ex.: caixa pequena apoiando caixa grande).
+    a sobreposição máxima possível (limitada pelo menor dos dois) atingir
+    `APOIO_MIN_PCT`% da base de `b` em ambos os eixos. Evita criar variáveis
+    para pares fisicamente impossíveis (ex.: caixa pequena apoiando caixa grande).
     """
     for ax, ay in ((dim_a["x"], dim_a["y"]), (dim_a["y"], dim_a["x"])):
         for bx, by in ((dim_b["x"], dim_b["y"]), (dim_b["y"], dim_b["x"])):
-            if 10 * min(ax, bx) >= 8 * bx and 10 * min(ay, by) >= 8 * by:
+            if (100 * min(ax, bx) >= APOIO_MIN_PCT * bx
+                    and 100 * min(ay, by) >= APOIO_MIN_PCT * by):
                 return True
     return False
 
@@ -55,11 +60,12 @@ def restricao_apoio(
     itens_dados: dict | None = None,
 ) -> None:
     """
-    Restrição de apoio: 80% da base (face inferior) deve estar suportada.
+    Restrição de apoio: `APOIO_MIN_PCT`% da base (face inferior) deve estar suportada.
 
     Todo item `b` deve estar no chão (`zi[b] == 0`) OU apoiado sobre um item
     `a` imediatamente abaixo (`zf[a] == zi[b]`) cuja sobreposição em XY cubra
-    pelo menos 80% da base de `b` em cada eixo (10*ov >= 8*dd).
+    pelo menos `APOIO_MIN_PCT`% da base de `b` em cada eixo
+    (100*ov >= APOIO_MIN_PCT*dd).
 
     Apenas a face inferior conta como apoio — contato lateral ou superior
     não sustenta o item. A disjunção `add_bool_or` obriga o solver a escolher
@@ -67,7 +73,7 @@ def restricao_apoio(
     livres e itens poderiam flutuar.
 
     `itens_dados` (opcional) habilita a poda de pares impossíveis: pares onde
-    `a` nunca alcançaria 80% da base de `b` não geram variáveis.
+    `a` nunca alcançaria `APOIO_MIN_PCT`% da base de `b` não geram variáveis.
     """
     n = len(carregar)
     for jj in range(n):
@@ -79,7 +85,7 @@ def restricao_apoio(
         model.add(zi[b] == 0).only_enforce_if(no_chao)
         apoios.append(no_chao)
 
-        # Alternativa 2: algum item `a` apoia a base de `b` em >= 80%
+        # Alternativa 2: algum item `a` apoia a base de `b` em >= APOIO_MIN_PCT%
         for ii in range(n):
             if ii == jj:
                 continue
@@ -106,8 +112,8 @@ def restricao_apoio(
             model.add_max_equality(Myi, [yi[a], yi[b]])
             model.add(ovy == myf - Myi)
 
-            model.add(10 * ovx >= 8 * ddx[b]).only_enforce_if(suporte)
-            model.add(10 * ovy >= 8 * ddy[b]).only_enforce_if(suporte)
+            model.add(100 * ovx >= APOIO_MIN_PCT * ddx[b]).only_enforce_if(suporte)
+            model.add(100 * ovy >= APOIO_MIN_PCT * ddy[b]).only_enforce_if(suporte)
 
             apoios.append(suporte)
 

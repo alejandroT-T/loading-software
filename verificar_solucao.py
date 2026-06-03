@@ -2,7 +2,7 @@
 
 Executa o pipeline completo com a planilha ativa e audita a solução com um
 verificador independente: limites do contêiner, não-sobreposição par a par e
-apoio >= 80% da base para todo item elevado.
+apoio >= APOIO_MIN_PCT% da base para todo item elevado.
 
 Uso:  .venv\\Scripts\\python.exe -X utf8 verificar_solucao.py
 """
@@ -10,6 +10,7 @@ from pathlib import Path
 
 from app.data.conteiners import CONTEINERES
 from app.data.modelos import carregar_itens
+from app.solver.restricoes import APOIO_MIN_PCT
 from app.solver.solver import resolver_carregamento
 
 c = CONTEINERES["40hc"]
@@ -35,7 +36,7 @@ for i, a in enumerate(lista):
         if sx and sy and sz:
             erros.append(f"SOBREPOSICAO: {a['nome']} x {b['nome']}")
 
-# 3. Apoio: todo item elevado tem um unico apoio cobrindo >= 80% em cada eixo
+# 3. Apoio: todo item elevado tem um unico apoio cobrindo >= APOIO_MIN_PCT% em cada eixo
 flutuando = []
 for e in lista:
     if e["st_z"] == 0:
@@ -47,14 +48,14 @@ for e in lista:
             continue
         ovx = min(p["end_x"], e["end_x"]) - max(p["st_x"], e["st_x"])
         ovy = min(p["end_y"], e["end_y"]) - max(p["st_y"], e["st_y"])
-        if 10 * ovx >= 8 * dx and 10 * ovy >= 8 * dy:
+        if 100 * ovx >= APOIO_MIN_PCT * dx and 100 * ovy >= APOIO_MIN_PCT * dy:
             apoiado = True
             break
     if not apoiado:
         flutuando.append(e["nome"])
 
 for n in flutuando:
-    erros.append(f"SEM APOIO 80%: {n}")
+    erros.append(f"SEM APOIO {APOIO_MIN_PCT}%: {n}")
 
 elevados = sum(1 for e in lista if e["st_z"] > 0)
 print()
@@ -64,4 +65,4 @@ if erros:
     for er in erros:
         print(f"  - {er}")
     raise SystemExit(1)
-print("VALIDACAO OK: sem sobreposicao, sem item fora, todo elevado com apoio >= 80% na base")
+print(f"VALIDACAO OK: sem sobreposicao, sem item fora, todo elevado com apoio >= {APOIO_MIN_PCT}% na base")

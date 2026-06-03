@@ -1,12 +1,12 @@
 """Heurística gulosa de empacotamento (warm start para o CP-SAT).
 
 Posiciona itens um a um (chão primeiro, fundo primeiro) respeitando as mesmas
-regras da fase 2 do solver: não-sobreposição e apoio de >= 80% da base por um
-único item imediatamente abaixo. Itens sem posição válida ficam de fora.
+regras da fase 2 do solver: não-sobreposição e apoio de >= APOIO_MIN_PCT% da
+base por um único item imediatamente abaixo. Itens sem posição válida ficam de fora.
 
 Testa um portfólio de ordenações e devolve a que carrega mais volume.
 """
-from app.solver.restricoes import LIMITE_PESADO_G
+from app.solver.restricoes import APOIO_MIN_PCT, LIMITE_PESADO_G
 
 
 def _sobrepoe(p: dict, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> bool:
@@ -16,7 +16,7 @@ def _sobrepoe(p: dict, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> 
 
 
 def _apoio_ok(colocados: list, x1: int, y1: int, z1: int, dx: int, dy: int) -> bool:
-    """Chão, ou um único item com topo em z1 cobrindo >= 80% da base em cada eixo."""
+    """Chão, ou um único item com topo em z1 cobrindo >= APOIO_MIN_PCT% da base em cada eixo."""
     if z1 == 0:
         return True
     for p in colocados:
@@ -24,7 +24,7 @@ def _apoio_ok(colocados: list, x1: int, y1: int, z1: int, dx: int, dy: int) -> b
             continue
         ovx = min(p["x2"], x1 + dx) - max(p["x1"], x1)
         ovy = min(p["y2"], y1 + dy) - max(p["y1"], y1)
-        if 10 * ovx >= 8 * dx and 10 * ovy >= 8 * dy:
+        if 100 * ovx >= APOIO_MIN_PCT * dx and 100 * ovy >= APOIO_MIN_PCT * dy:
             return True
     return False
 

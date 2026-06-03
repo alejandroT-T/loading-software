@@ -2,6 +2,7 @@ from ortools.sat.python import cp_model
 from app.data.conteiners import Conteiner
 from app.solver.heuristica import empacotamento_guloso
 from app.solver.restricoes import (
+    APOIO_MIN_PCT,
     restricao_pesados_no_chao,
     restricao_apoio,
     restricao_nao_sobreposicao,
@@ -48,7 +49,7 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
         return None, None
     if fora_geometria:
         print(f"⚠️  Fase 1.5: {len(fora_geometria)} item(ns) sem posição válida "
-              f"(sem espaço com apoio de 80%) — ficarão fora do carregamento.")
+              f"(sem espaço com apoio de {APOIO_MIN_PCT}%) — ficarão fora do carregamento.")
     carregar   = [i for i in carregar if i in posicoes]
     vol_total  = sum(itens_dados[i]["volume"] for i in carregar)
     peso_total = sum(itens_dados[i]["peso"]   for i in carregar)
@@ -94,7 +95,7 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
     # Penalidade = C_cz por item fora do chão, somada ao objetivo de Minimize(x_max)
     penalidades_chao = restricao_pesados_no_chao(m2, carregar, itens_dados, zi)  # lista de (nome, chao_boolvar)
 
-    # ── Restrição de apoio: 80% da base deve estar suportada ─────────────────
+    # ── Restrição de apoio: APOIO_MIN_PCT% da base deve estar suportada ──────
     restricao_apoio(m2, carregar, xi, xf, yi, yf, zi, zf, ddx, ddy, C_cx, C_cy,
                     itens_dados=itens_dados)
 
