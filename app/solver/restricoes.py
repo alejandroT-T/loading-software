@@ -5,7 +5,7 @@ LIMITE_PESADO_G = 80_000  # 80 kg
 
 # Fração mínima da base que deve estar apoiada, em % (usada como
 # 100*ov >= APOIO_MIN_PCT*dd para manter a aritmética inteira do CP-SAT)
-APOIO_MIN_PCT = 60
+APOIO_MIN_PCT = 75
 
 
 def restricao_pesados_no_chao(
@@ -58,6 +58,7 @@ def restricao_apoio(
     ddx: dict, ddy: dict,
     C_cx: int, C_cy: int,
     itens_dados: dict | None = None,
+    colocado: dict | None = None,
 ) -> None:
     """
     Restrição de apoio: `APOIO_MIN_PCT`% da base (face inferior) deve estar suportada.
@@ -74,6 +75,10 @@ def restricao_apoio(
 
     `itens_dados` (opcional) habilita a poda de pares impossíveis: pares onde
     `a` nunca alcançaria `APOIO_MIN_PCT`% da base de `b` não geram variáveis.
+
+    `colocado` (opcional) habilita a colocação opcional: a exigência de apoio só
+    vale para itens colocados (`add_bool_or(...).only_enforce_if(colocado[b])`) e
+    um item só pode apoiar outro se ele próprio estiver colocado.
     """
     n = len(carregar)
     for jj in range(n):
@@ -115,10 +120,18 @@ def restricao_apoio(
             model.add(100 * ovx >= APOIO_MIN_PCT * ddx[b]).only_enforce_if(suporte)
             model.add(100 * ovy >= APOIO_MIN_PCT * ddy[b]).only_enforce_if(suporte)
 
+            # `a` só pode apoiar `b` se ambos estiverem colocados
+            if colocado is not None:
+                model.add_implication(suporte, colocado[a])
+                model.add_implication(suporte, colocado[b])
+
             apoios.append(suporte)
 
-        # `b` precisa de pelo menos uma alternativa de apoio válida
-        model.add_bool_or(apoios)
+        # `b` precisa de pelo menos uma alternativa de apoio válida (só se colocado)
+        if colocado is not None:
+            model.add_bool_or(apoios).only_enforce_if(colocado[b])
+        else:
+            model.add_bool_or(apoios)
 
 
 def restricao_nao_sobreposicao(
@@ -127,6 +140,7 @@ def restricao_nao_sobreposicao(
     xi: dict, xf: dict,
     yi: dict, yf: dict,
     zi: dict, zf: dict,
+    colocado: dict | None = None,
 ) -> None:
     """
     Não-sobreposição: dois itens não podem ocupar o mesmo espaço.
@@ -134,6 +148,9 @@ def restricao_nao_sobreposicao(
     Para cada par (a, b) cria 6 separadores booleanos — `a` inteiramente
     antes/depois de `b` em X, Y ou Z — e exige que pelo menos um valha
     (disjunção via AddBoolOr).
+
+    `colocado` (opcional) habilita a colocação opcional: a separação só é exigida
+    quando AMBOS os itens estão colocados.
     """
     n = len(carregar)
     for ii in range(n):
@@ -146,4 +163,7 @@ def restricao_nao_sobreposicao(
             model.add(yi[a] >= yf[b]).only_enforce_if(s[3])
             model.add(zf[a] <= zi[b]).only_enforce_if(s[4])
             model.add(zi[a] >= zf[b]).only_enforce_if(s[5])
-            model.add_bool_or(s)
+            if colocado is not None:
+                model.add_bool_or(s).only_enforce_if([colocado[a], colocado[b]])
+            else:
+                model.add_bool_or(s)

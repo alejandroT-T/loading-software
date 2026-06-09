@@ -1,15 +1,106 @@
 from ortools.sat.python import cp_model
 from app.data.conteiners import Conteiner
-from app.solver.heuristica import empacotamento_guloso
+from app.solver.heuristica import empacotamento_guloso, _tentar_colocar
 from app.solver.restricoes import (
     APOIO_MIN_PCT,
+    LIMITE_PESADO_G,
     restricao_pesados_no_chao,
     restricao_apoio,
     restricao_nao_sobreposicao,
 )
 
 
-def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
+def _criar_vars_geometria(model, itens, itens_dados, C_cx, C_cy, C_cz):
+    """Cria, para cada item, as IntVars de origem/fim e o BoolVar de giro (troca
+    X↔Y), com xf=xi+dx etc. e dentro dos limites do contêiner. (Mesma lógica que
+    a fase 2 monta inline.) Retorna (xi, yi, zi, xf, yf, zf, ddx, ddy, giros)."""
+    xi, yi, zi, xf, yf, zf, ddx, ddy, giros = ({} for _ in range(9))
+    for item in itens:
+        dim = itens_dados[item]
+        giro = model.new_bool_var(f'g_{item}')
+        giros[item] = giro
+        ddx[item] = model.new_int_var(0, C_cx, f'dx_{item}')
+        ddy[item] = model.new_int_var(0, C_cy, f'dy_{item}')
+        model.add(ddx[item] == dim["x"]).only_enforce_if(giro.negated())
+        model.add(ddy[item] == dim["y"]).only_enforce_if(giro.negated())
+        model.add(ddx[item] == dim["y"]).only_enforce_if(giro)
+        model.add(ddy[item] == dim["x"]).only_enforce_if(giro)
+        xi[item] = model.new_int_var(0, C_cx, f'xi_{item}')
+        yi[item] = model.new_int_var(0, C_cy, f'yi_{item}')
+        zi[item] = model.new_int_var(0, C_cz, f'zi_{item}')
+        xf[item] = model.new_int_var(0, C_cx, f'xf_{item}')
+        yf[item] = model.new_int_var(0, C_cy, f'yf_{item}')
+        zf[item] = model.new_int_var(0, C_cz, f'zf_{item}')
+        model.add(xf[item] == xi[item] + ddx[item])
+        model.add(yf[item] == yi[item] + ddy[item])
+        model.add(zf[item] == zi[item] + dim["z"])
+        model.add(xf[item] <= C_cx)
+        model.add(yf[item] <= C_cy)
+        model.add(zf[item] <= C_cz)
+    return xi, yi, zi, xf, yf, zf, ddx, ddy, giros
+
+
+def _compactar_e_reinserir(carregar, pos_inicial, itens_dados, nomes_itens,
+                           C_cx, C_cy, C_cz, tempo):
+    """FASE 3 — com o conjunto de itens FIXO, reorganiza o contêiner para eliminar
+    vãos (minimiza Σ das posições → empurra tudo ao canto fundo-esquerda-piso),
+    mantendo apoio mínimo e não-sobreposição. Depois tenta reinserir, no espaço
+    liberado, os itens que ficaram de fora (guloso). Determinístico e limitado.
+
+    Retorna {item: {x, y, z, dx, dy, girado}} com o layout final."""
+    if not carregar:
+        return dict(pos_inicial)
+
+    m3 = cp_model.CpModel()
+    xi, yi, zi, xf, yf, zf, ddx, ddy, giros = _criar_vars_geometria(
+        m3, carregar, itens_dados, C_cx, C_cy, C_cz)
+    restricao_apoio(m3, carregar, xi, xf, yi, yf, zi, zf, ddx, ddy, C_cx, C_cy,
+                    itens_dados=itens_dados)
+    restricao_nao_sobreposicao(m3, carregar, xi, xf, yi, yf, zi, zf)
+    # Compactação: puxa cada caixa para o canto (fundo X=0, lateral Y=0, piso Z=0)
+    m3.minimize(sum(xi[i] + yi[i] + zi[i] for i in carregar))
+    for i in carregar:  # warm start = layout da fase 2 (garante resultado ≤ a ele)
+        p = pos_inicial[i]
+        m3.add_hint(xi[i], p["x"]); m3.add_hint(yi[i], p["y"]); m3.add_hint(zi[i], p["z"])
+        m3.add_hint(giros[i], int(p["girado"]))
+
+    s3 = cp_model.CpSolver()
+    s3.parameters.max_time_in_seconds = tempo
+    s3.parameters.num_workers = 8
+    s3.parameters.random_seed = 1
+    if s3.solve(m3) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print("⚠️  Fase 3: compactação não convergiu — mantendo layout da fase 2.")
+        return dict(pos_inicial)
+
+    final_pos = {
+        i: {"x": s3.value(xi[i]), "y": s3.value(yi[i]), "z": s3.value(zi[i]),
+            "dx": s3.value(ddx[i]), "dy": s3.value(ddy[i]),
+            "girado": s3.value(ddx[i]) != itens_dados[i]["x"]}
+        for i in carregar
+    }
+    print("🧱 Fase 3: layout compactado (vãos reduzidos).")
+
+    # Reinserção das sobras no layout compactado (menores primeiro: encaixam em vãos)
+    colocados = [
+        {"nome": i, "x1": p["x"], "y1": p["y"], "z1": p["z"],
+         "x2": p["x"] + p["dx"], "y2": p["y"] + p["dy"], "z2": p["z"] + itens_dados[i]["z"]}
+        for i, p in final_pos.items()
+    ]
+    posicoes_novas: dict = {}
+    sobras = sorted((i for i in nomes_itens if i not in final_pos),
+                    key=lambda i: itens_dados[i]["volume"])
+    for i in sobras:
+        _tentar_colocar(i, itens_dados, colocados, posicoes_novas, C_cx, C_cy, C_cz)
+    final_pos.update(posicoes_novas)
+    if posicoes_novas:
+        print(f"➕ Fase 3 reinseriu {len(posicoes_novas)} item(ns) no espaço liberado "
+              f"→ {len(final_pos)} itens.")
+    return final_pos
+
+
+def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: float = 180.0) -> tuple:
+    """`tempo_fase2`: tempo (s) que a fase 2 (CP-SAT) tem para maximizar o nº de
+    itens e compactar. Mais tempo pode encaixar mais itens."""
     C_cx, C_cy, C_cz = conteiner.cx, conteiner.cy, conteiner.cz
     peso_max = conteiner.peso_max
     vol_max  = conteiner.vol_max
@@ -18,51 +109,72 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
     nomes_itens = list(itens_dados.keys())
     num_itens   = len(nomes_itens)
 
-    # ═══ FASE 1 — Selecionar quais itens cabem (maximizar volume) ══════════════
+    # ═══ FASE 1 — Selecionar o MÁXIMO de VOLUME que cabe (peso/volume) ═════════
+    # Objetivo PRINCIPAL: maximizar o VOLUME selecionado; quantidade só como desempate.
+    # Peso lexicográfico: cada item soma 1 ao termo de contagem, então W_VOL =
+    # (num_itens + 1) garante que qualquer ganho de 1 cm³ supere qualquer diferença
+    # de contagem. A física (apoio mínimo / não-sobreposição) NÃO entra aqui — só
+    # capacidade; quem valida fisicamente e define o que realmente cabe é a fase 1.5.
     m1   = cp_model.CpModel()
     rest = {i: m1.new_bool_var(f'r_{i}') for i in nomes_itens}
 
     m1.add(sum(rest[i] * int(itens_dados[i]["peso"])   for i in nomes_itens) <= peso_max)
     m1.add(sum(rest[i] * int(itens_dados[i]["volume"]) for i in nomes_itens) <= vol_max)
-    m1.maximize(sum(rest[i] * itens_dados[i]["volume"] for i in nomes_itens))
+    W_VOL = num_itens + 1  # garante prioridade absoluta do volume sobre a contagem
+    m1.maximize(
+        sum(rest[i] * int(itens_dados[i]["volume"]) * W_VOL for i in nomes_itens)
+        + sum(rest[i] for i in nomes_itens)
+    )
 
     s1 = cp_model.CpSolver()
-    s1.parameters.max_time_in_seconds = 1800.0
+    s1.parameters.max_time_in_seconds = 300.0  # knapsack pequeno resolve rápido; teto por segurança
     if s1.solve(m1) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("❌ Fase 1: nenhuma solução viável.")
         return None, None
 
-    carregar   = [i for i in nomes_itens if s1.value(rest[i]) == 1]
-    vol_total  = sum(itens_dados[i]["volume"] for i in carregar)
-    peso_total = sum(itens_dados[i]["peso"]   for i in carregar)
+    selecao = [i for i in nomes_itens if s1.value(rest[i]) == 1]
+    vol_sel = sum(itens_dados[i]["volume"] for i in selecao)
 
-    restringir_ao_meio = vol_total * 2 <= vol_max
-
-    # ═══ FASE 1.5 — Heurística gulosa: solução viável inicial (warm start) ════
-    # O CP-SAT sozinho não encontra a primeira solução com apoio obrigatório em
-    # tempo hábil. O guloso posiciona o que cabe; o que não couber é reportado
-    # como não carregado, e o CP-SAT parte da solução gulosa para compactar.
+    # ═══ FASE 1.5 — Empacotar validando a física (apoio mínimo + não-sobrep.) ══
+    # O guloso testa um amplo portfólio de ordenações e devolve a que posiciona
+    # MAIS itens (volume como desempate) — é aqui que se maximiza, de fato, o nº de
+    # itens com física válida. Quem não couber sai e é reportado como não carregado.
+    # Serve também de warm start: sem ele o CP-SAT não acha a 1ª solução viável em
+    # tempo hábil.
+    restringir_ao_meio = vol_sel * 2 <= vol_max
     x_limite = meio if restringir_ao_meio else C_cx
-    posicoes, fora_geometria = empacotamento_guloso(carregar, itens_dados, x_limite, C_cy, C_cz)
+    posicoes, fora_geometria = empacotamento_guloso(selecao, itens_dados, x_limite, C_cy, C_cz)
     if not posicoes:
         print("❌ Fase 1.5: heurística não posicionou nenhum item.")
         return None, None
     if fora_geometria:
-        print(f"⚠️  Fase 1.5: {len(fora_geometria)} item(ns) sem posição válida "
+        print(f"⚠️  Fase 1.5: {len(fora_geometria)} de {len(selecao)} itens sem posição válida "
               f"(sem espaço com apoio de {APOIO_MIN_PCT}%) — ficarão fora do carregamento.")
-    carregar   = [i for i in carregar if i in posicoes]
+    print(f"✅ Máximo de itens com física válida: {len(posicoes)}/{len(selecao)}")
+    carregar   = list(posicoes.keys())
     vol_total  = sum(itens_dados[i]["volume"] for i in carregar)
     peso_total = sum(itens_dados[i]["peso"]   for i in carregar)
 
-    # ═══ FASE 2 — Posicionar do fundo (X=0) para frente, compactando ao fundo ═
+    # ═══ FASE 2 — Colocação OPCIONAL: maximizar nº de itens + compactar ═══════
+    # Diferente das fases anteriores: aqui o CP-SAT decide QUAIS itens entram.
+    # Cada item de `selecao` recebe um booleano `colocado`; as restrições físicas
+    # (apoio, não-sobreposição) só valem para itens colocados. O objetivo é
+    # lexicográfico — primeiro MAXIMIZAR a contagem de itens, depois compactar
+    # ao fundo (x_max) e manter pesados no chão. O guloso entra como warm start
+    # (itens posicionados → colocado=1; o resto → colocado=0), então o solver só
+    # pode melhorar a contagem. `selecao` ⊇ `posicoes`, então pode recuperar os
+    # itens que o guloso não conseguiu encaixar.
+    itens2 = selecao
     m2 = cp_model.CpModel()
     xi, yi, zi = {}, {}, {}
     xf, yf, zf = {}, {}, {}
     ddx, ddy   = {}, {}
     giros      = {}
+    colocado   = {}
 
-    for item in carregar:
+    for item in itens2:
         dim  = itens_dados[item]
+        colocado[item] = m2.new_bool_var(f'c_{item}')
         giro = m2.new_bool_var(f'g_{item}')
         giros[item] = giro
 
@@ -89,47 +201,102 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
         m2.add(zf[item] <= C_cz)
 
         if restringir_ao_meio:
-            m2.add(xf[item] <= meio)
+            m2.add(xf[item] <= meio).only_enforce_if(colocado[item])
+
+    # ── Capacidade (peso/volume) só conta itens colocados ────────────────────
+    m2.add(sum(colocado[i] * int(itens_dados[i]["peso"])   for i in itens2) <= peso_max)
+    m2.add(sum(colocado[i] * int(itens_dados[i]["volume"]) for i in itens2) <= vol_max)
 
     # ── Restrição suave: pesados (>80 kg) devem ficar no chão ────────────────
-    # Penalidade = C_cz por item fora do chão, somada ao objetivo de Minimize(x_max)
-    penalidades_chao = restricao_pesados_no_chao(m2, carregar, itens_dados, zi)  # lista de (nome, chao_boolvar)
+    penalidades_chao = restricao_pesados_no_chao(m2, itens2, itens_dados, zi)  # lista de (nome, chao_boolvar)
 
-    # ── Restrição de apoio: APOIO_MIN_PCT% da base deve estar suportada ──────
-    restricao_apoio(m2, carregar, xi, xf, yi, yf, zi, zf, ddx, ddy, C_cx, C_cy,
-                    itens_dados=itens_dados)
+    # ── Restrição de apoio: APOIO_MIN_PCT% da base, só para itens colocados ──
+    restricao_apoio(m2, itens2, xi, xf, yi, yf, zi, zf, ddx, ddy, C_cx, C_cy,
+                    itens_dados=itens_dados, colocado=colocado)
 
-    # ── Não-sobreposição ──────────────────────────────────────────────────────
-    restricao_nao_sobreposicao(m2, carregar, xi, xf, yi, yf, zi, zf)
+    # ── Não-sobreposição (só entre pares de itens colocados) ─────────────────
+    restricao_nao_sobreposicao(m2, itens2, xi, xf, yi, yf, zi, zf, colocado=colocado)
 
+    # Envelope da carga em cada eixo (só conta itens colocados). Minimizá-los no
+    # objetivo empurra a carga contra o fundo (X=0), uma lateral (Y=0) e o piso
+    # (Z=0): vira um bloco sólido encostado em 3 faces. Compactação LEVE — usar
+    # Σ(xi+yi+zi) aqui inchava W_ITEM (~109k) e a fase 2 perdia itens em 180s; a
+    # compactação INTERNA fica a cargo da fase 3 (conjunto fixo, sem competir com
+    # a contagem).
     x_max = m2.new_int_var(0, C_cx, 'x_max')
-    for item in carregar:
-        m2.add(x_max >= xf[item])
+    y_max = m2.new_int_var(0, C_cy, 'y_max')
+    z_max = m2.new_int_var(0, C_cz, 'z_max')
+    for item in itens2:
+        m2.add(x_max >= xf[item]).only_enforce_if(colocado[item])
+        m2.add(y_max >= yf[item]).only_enforce_if(colocado[item])
+        m2.add(z_max >= zf[item]).only_enforce_if(colocado[item])
 
-    # Penalidade por item pesado fora do chão: cada violação custa C_cz cm no objetivo
+    # Objetivo lexicográfico: a contagem domina (peso W > custo máx. dos demais
+    # termos). Maximiza itens; entre soluções de mesma contagem, compacta o
+    # envelope nos 3 eixos (−x_max−y_max−z_max → bloco encostado em fundo/
+    # lateral/piso) e prefere pesados no chão (−penalidade).
     penalidade_total = sum(C_cz * bv for _, bv in penalidades_chao)
-    m2.minimize(x_max + penalidade_total)
+    # W_ITEM > custo máx. possível dos demais termos (compactação ≤ C_cx+C_cy+C_cz
+    # + penalidade ≤ C_cz·n_pesados), garantindo que ganhar 1 item jamais seja
+    # trocado por compactar.
+    W_ITEM = C_cx + C_cy + C_cz + C_cz * len(penalidades_chao) + 1
+    m2.maximize(
+        W_ITEM * sum(colocado[i] for i in itens2)
+        - x_max - y_max - z_max
+        - penalidade_total
+    )
 
-    # Warm start: o CP-SAT parte da solução gulosa e usa o tempo para melhorá-la
-    for item in carregar:
-        p = posicoes[item]
-        m2.add_hint(xi[item], p["x"])
-        m2.add_hint(yi[item], p["y"])
-        m2.add_hint(zi[item], p["z"])
-        m2.add_hint(giros[item], int(p["girado"]))
+    # Warm start: solução gulosa (itens posicionados → colocado=1; resto → 0)
+    placed = set(posicoes)
+    for item in itens2:
+        m2.add_hint(colocado[item], 1 if item in placed else 0)
+        if item in placed:
+            p = posicoes[item]
+            m2.add_hint(xi[item], p["x"])
+            m2.add_hint(yi[item], p["y"])
+            m2.add_hint(zi[item], p["z"])
+            m2.add_hint(giros[item], int(p["girado"]))
 
     s2 = cp_model.CpSolver()
-    s2.parameters.max_time_in_seconds = 60.0
+    s2.parameters.max_time_in_seconds = tempo_fase2
     s2.parameters.num_workers = 8
+    s2.parameters.random_seed = 1  # reprodutibilidade (não elimina variância do corte por tempo)
     status2 = s2.solve(m2)
 
     if status2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("❌ Fase 2: não foi possível posicionar os itens.")
         return None, None
 
-    avanco = s2.value(x_max)
+    # A fase 2 redefine quais itens entram (pode recuperar itens que o guloso descartou)
+    carregar = [i for i in itens2 if s2.value(colocado[i]) == 1]
+    pos2 = {
+        i: {"x": s2.value(xi[i]), "y": s2.value(yi[i]), "z": s2.value(zi[i]),
+            "dx": s2.value(ddx[i]), "dy": s2.value(ddy[i]),
+            "girado": s2.value(ddx[i]) != itens_dados[i]["x"]}
+        for i in carregar
+    }
+    if len(carregar) > len(placed):
+        print(f"🎯 Fase 2 recuperou {len(carregar) - len(placed)} item(ns) além do guloso "
+              f"→ {len(carregar)} itens.")
+    if status2 == cp_model.OPTIMAL:
+        print("ℹ️  Fase 2: ÓTIMO PROVADO — este é o nº máximo de itens possível.")
+    else:
+        print(f"ℹ️  Fase 2: melhor solução em {tempo_fase2:.0f}s (não provada ótima) "
+              f"— aumentar o tempo pode encaixar mais itens.")
 
-    pesados_fora_chao = [nome for nome, bv in penalidades_chao if s2.value(bv) == 1]
+    # ═══ FASE 3 — Compactar (eliminar vãos) + reinserir sobras ════════════════
+    final_pos = _compactar_e_reinserir(
+        carregar, pos2, itens_dados, nomes_itens,
+        C_cx, C_cy, C_cz, min(30.0, tempo_fase2),
+    )
+    carregar = list(final_pos.keys())
+
+    # ── Estatísticas a partir do layout final ────────────────────────────────
+    vol_total  = sum(itens_dados[i]["volume"] for i in carregar)
+    peso_total = sum(itens_dados[i]["peso"]   for i in carregar)
+    avanco     = max((final_pos[i]["x"] + final_pos[i]["dx"] for i in carregar), default=0)
+    pesados_colocados = [i for i in carregar if itens_dados[i]["peso"] > LIMITE_PESADO_G]
+    pesados_fora_chao = [i for i in pesados_colocados if final_pos[i]["z"] > 0]
 
     print("=" * 60)
     print("   MAPA DE CARREGAMENTO 3D — FUNDO PARA FRENTE (COM APOIO)   ")
@@ -138,10 +305,8 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
     print(f"⚖️  Peso total       : {peso_total/1000:.1f} kg / {peso_max/1000:.0f} kg ({100*peso_total/peso_max:.1f}%)")
     print(f"📦 Volume total     : {vol_total:,} cm³ / {vol_max:,} cm³ ({100*vol_total/vol_max:.1f}%)")
     print(f"📏 Avanço no contêiner: {avanco} cm de {C_cx} cm ({100*avanco/C_cx:.1f}% do comprimento)")
-    if restringir_ao_meio:
-        print(f"🔒 Poucos itens → carga restrita à metade traseira (0 – {meio} cm)")
-    if penalidades_chao:
-        n_pesados = len(penalidades_chao)
+    if pesados_colocados:
+        n_pesados = len(pesados_colocados)
         n_fora    = len(pesados_fora_chao)
         print(f"⚠️  Itens >80 kg no chão: {n_pesados - n_fora}/{n_pesados}", end="")
         if pesados_fora_chao:
@@ -151,18 +316,15 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict) -> tuple:
 
     lista_carregamento = []
     for item in carregar:
-        _xi = s2.value(xi[item]); _xf = s2.value(xf[item])
-        _yi = s2.value(yi[item]); _yf = s2.value(yf[item])
-        _zi = s2.value(zi[item]); _zf = s2.value(zf[item])
-        _dx = s2.value(ddx[item]); _dy = s2.value(ddy[item])
-        girado = "Sim (90°)" if _dx != itens_dados[item]["x"] else "Não"
+        p = final_pos[item]
+        _dx, _dy = p["dx"], p["dy"]
         lista_carregamento.append({
             "nome":  item,
-            "st_x":  _xi,  "end_x": _xf,
-            "st_y":  _yi,  "end_y": _yf,
-            "st_z":  _zi,  "end_z": _zf,
-            "dx":    _dx,  "dy":    _dy,
-            "girado": girado,
+            "st_x":  p["x"], "end_x": p["x"] + _dx,
+            "st_y":  p["y"], "end_y": p["y"] + _dy,
+            "st_z":  p["z"], "end_z": p["z"] + itens_dados[item]["z"],
+            "dx":    _dx,    "dy":    _dy,
+            "girado": "Sim (90°)" if p["girado"] else "Não",
         })
 
     lista_carregamento.sort(key=lambda e: e["st_x"])

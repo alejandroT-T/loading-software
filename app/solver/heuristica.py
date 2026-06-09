@@ -112,12 +112,23 @@ def empacotamento_guloso(carregar: list, itens_dados: dict,
     def _d(i):
         return itens_dados[i]
 
+    # Portfólio de ordenações (todas aplicadas com reverse=True → maior chave
+    # primeiro; chaves negadas significam "menor primeiro"). Quanto mais ângulos
+    # de empacotamento testamos, mais itens tendem a caber — o guloso é barato e
+    # ficamos sempre com a ordenação que posiciona o MAIOR nº de itens.
     ordens = (
-        lambda i: (_d(i)["volume"],),
-        lambda i: (_d(i)["peso"] > LIMITE_PESADO_G, _d(i)["x"] * _d(i)["y"]),
-        lambda i: (_d(i)["x"] * _d(i)["y"], _d(i)["z"]),
-        lambda i: (_d(i)["z"], _d(i)["x"] * _d(i)["y"]),
-        lambda i: (_d(i)["peso"] > LIMITE_PESADO_G, _d(i)["z"]),
+        lambda i: (_d(i)["volume"],),                                            # maior volume
+        lambda i: (_d(i)["peso"] > LIMITE_PESADO_G, _d(i)["x"] * _d(i)["y"]),     # pesados, depois base
+        lambda i: (_d(i)["x"] * _d(i)["y"], _d(i)["z"]),                         # maior base, depois alto
+        lambda i: (_d(i)["z"], _d(i)["x"] * _d(i)["y"]),                         # mais alto, depois base
+        lambda i: (_d(i)["peso"] > LIMITE_PESADO_G, _d(i)["z"]),                  # pesados, depois alto
+        lambda i: (max(_d(i)["x"], _d(i)["y"], _d(i)["z"]),),                     # maior dimensão
+        lambda i: (_d(i)["x"] * _d(i)["y"], -_d(i)["z"]),                        # maior base, mais baixo 1º
+        lambda i: (_d(i)["peso"], _d(i)["x"] * _d(i)["y"]),                       # mais pesado, depois base
+        lambda i: (_d(i)["x"] * _d(i)["y"] * _d(i)["z"],),                        # maior caixa-envolvente
+        lambda i: (-_d(i)["x"] * _d(i)["y"], _d(i)["z"]),                        # menor base 1º (preenche vãos)
+        lambda i: (_d(i)["peso"] > LIMITE_PESADO_G, _d(i)["volume"]),             # pesados, depois volume
+        lambda i: (-_d(i)["volume"],),                                            # menor volume 1º
     )
 
     melhor_score = (-1, -1)
