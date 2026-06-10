@@ -40,7 +40,7 @@ app/
 
 `resolver_carregamento(conteiner, itens_dados, tempo_fase2=180.0, progresso=None) -> (lista_carregamento, itens_dados)` (retorna `(None, None)` se inviável). `progresso` é um callback opcional `f(msg: str)` chamado no início de cada fase — o front web o usa para mostrar "Fase N de 3 …" no status durante o polling (os `print()` continuam no console):
 
-**Fase 1 — seleção por capacidade** (CP-SAT, teto 300s): uma BoolVar por item. Objetivo PRINCIPAL = **maximizar a quantidade de itens**; volume só como desempate (peso lexicográfico `PESO_ITEM = vol_max + 1` por item → +1 item supera qualquer ganho de volume), sujeito a peso ≤ `peso_max` e volume ≤ `vol_max`. Produz a seleção `selecao`. Nota: com a planilha real a capacidade **não é o gargalo** (peso ~11%, volume ~71%) — os 64 itens cabem por capacidade, então quem limita é a física (fase 1.5). Maximizar contagem em vez de volume importa apenas quando a capacidade for o gargalo.
+**Fase 1 — seleção por capacidade** (CP-SAT, teto **15s**): uma BoolVar por item. O teto é curto de propósito: quando a capacidade é o gargalo (contêiner pequeno), a boa solução sai em segundos mas a *prova* de otimalidade pode levar minutos (coeficientes de volume em cm³ enormes) — como FEASIBLE é aceito, cortar a prova não muda o resultado prático (antes era 300s e uma execução com contêiner pequeno consumia o teto inteiro). Objetivo PRINCIPAL = **maximizar a quantidade de itens**; volume só como desempate (peso lexicográfico `PESO_ITEM = vol_max + 1` por item → +1 item supera qualquer ganho de volume), sujeito a peso ≤ `peso_max` e volume ≤ `vol_max`. Produz a seleção `selecao`. Nota: com a planilha real a capacidade **não é o gargalo** (peso ~11%, volume ~71%) — os 64 itens cabem por capacidade, então quem limita é a física (fase 1.5). Maximizar contagem em vez de volume importa apenas quando a capacidade for o gargalo.
 
 **Fase 1.5 — empacotamento com física validada** (`heuristica.py`, instantânea): o guloso posiciona os itens um a um (chão/fundo primeiro) respeitando não-sobreposição e apoio mínimo `APOIO_MIN_PCT`. Testa um **portfólio de ~12 ordenações** e devolve a que posiciona **MAIS itens** (volume como desempate) — é aqui que se maximiza, de fato, o nº de itens com física válida. Itens sem posição saem e são reportados, **mas a fase 2 pode recuperá-los** (ver abaixo). **Essencial como warm start**: sem ele o CP-SAT não encontra a 1ª solução viável em tempo hábil (testado: UNKNOWN após 300s). O guloso entra na fase 2 via `posicoes` (itens posicionados → `colocado=1`; o resto → `colocado=0`).
 
@@ -69,7 +69,7 @@ O CP-SAT exige inteiros; tudo é convertido na leitura (`modelos.py`):
 
 ### Dados de entrada (`data_load/`)
 
-Planilha ativa definida em `app/main.py` (`CAMINHO_XLSX`, hoje `data_items_ajustada.xlsx`). Colunas: `ITEM`, `qtd` (opcional), `peso` (kg), `comprimento` (X), `profundidade` (Y), `altura` (Z), `volume`. Com coluna `qtd`, cada linha expande em N cópias `nome_1..nome_N`; sem ela, duplicatas ganham sufixo `_2`, `_3`, ….
+Planilha ativa definida em `app/main.py` (`CAMINHO_XLSX`, hoje `data_items_1.xlsx`; também usada por `verificar_solucao.py`). Colunas: `ITEM`, `qtd` (opcional), `peso` (kg), `comprimento` (X), `profundidade` (Y), `altura` (Z), `volume`. Com coluna `qtd`, cada linha expande em N cópias `nome_1..nome_N`; sem ela, duplicatas ganham sufixo `_2`, `_3`, ….
 
 ### Contêineres (`app/data/conteiners.py`)
 

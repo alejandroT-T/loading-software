@@ -135,7 +135,11 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: 
     )
 
     s1 = cp_model.CpSolver()
-    s1.parameters.max_time_in_seconds = 300.0  # knapsack pequeno resolve rápido; teto por segurança
+    # Teto curto de propósito: a boa solução sai em segundos; o que demora é a
+    # PROVA de otimalidade (coeficientes de volume em cm³ são enormes) quando a
+    # capacidade é o gargalo (contêiner pequeno). FEASIBLE é aceito abaixo, então
+    # cortar a prova não muda o resultado prático — só evita ~300s de espera.
+    s1.parameters.max_time_in_seconds = 15.0
     if s1.solve(m1) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("❌ Fase 1: nenhuma solução viável.")
         return None, None

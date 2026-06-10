@@ -5,7 +5,7 @@ from app.data.conteiners import CONTEINERES, conteiner_personalizado
 from app.solver.solver import resolver_carregamento
 from app.interface.visualizacao import visualizar_carregamento
 
-CAMINHO_XLSX = Path(__file__).parent.parent / "data_load" / "data_items_ajustada.xlsx"
+CAMINHO_XLSX = Path(__file__).parent.parent / "data_load" / "data_items_1.xlsx"
 
 # Escolha o contêiner: "20ft" | "40ft" | "40hc" | "45hc" | personalizado abaixo
 CONTEINER = CONTEINERES["40hc"]

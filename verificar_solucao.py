@@ -14,7 +14,7 @@ from app.solver.restricoes import APOIO_MIN_PCT
 from app.solver.solver import resolver_carregamento
 
 c = CONTEINERES["40hc"]
-itens = carregar_itens(Path("data_load/data_items_ajustada.xlsx"))
+itens = carregar_itens(Path("data_load/data_items_1.xlsx"))
 lista, dados = resolver_carregamento(c, itens)
 assert lista, "solver nao retornou solucao"
 
