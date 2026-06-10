@@ -38,7 +38,7 @@ app/
 
 ### Pipeline do solver (`app/solver/solver.py`)
 
-`resolver_carregamento(conteiner, itens_dados) -> (lista_carregamento, itens_dados)` (retorna `(None, None)` se inviável):
+`resolver_carregamento(conteiner, itens_dados, tempo_fase2=180.0, progresso=None) -> (lista_carregamento, itens_dados)` (retorna `(None, None)` se inviável). `progresso` é um callback opcional `f(msg: str)` chamado no início de cada fase — o front web o usa para mostrar "Fase N de 3 …" no status durante o polling (os `print()` continuam no console):
 
 **Fase 1 — seleção por capacidade** (CP-SAT, teto 300s): uma BoolVar por item. Objetivo PRINCIPAL = **maximizar a quantidade de itens**; volume só como desempate (peso lexicográfico `PESO_ITEM = vol_max + 1` por item → +1 item supera qualquer ganho de volume), sujeito a peso ≤ `peso_max` e volume ≤ `vol_max`. Produz a seleção `selecao`. Nota: com a planilha real a capacidade **não é o gargalo** (peso ~11%, volume ~71%) — os 64 itens cabem por capacidade, então quem limita é a física (fase 1.5). Maximizar contagem em vez de volume importa apenas quando a capacidade for o gargalo.
 

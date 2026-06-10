@@ -98,9 +98,16 @@ def _compactar_e_reinserir(carregar, pos_inicial, itens_dados, nomes_itens,
     return final_pos
 
 
-def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: float = 180.0) -> tuple:
+def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: float = 180.0,
+                          progresso=None) -> tuple:
     """`tempo_fase2`: tempo (s) que a fase 2 (CP-SAT) tem para maximizar o nº de
-    itens e compactar. Mais tempo pode encaixar mais itens."""
+    itens e compactar. Mais tempo pode encaixar mais itens.
+    `progresso`: callback opcional `f(msg: str)` chamado no início de cada fase
+    (usado pelo front para mostrar o andamento; os prints continuam no console)."""
+    def _prog(msg):
+        if progresso:
+            progresso(msg)
+
     C_cx, C_cy, C_cz = conteiner.cx, conteiner.cy, conteiner.cz
     peso_max = conteiner.peso_max
     vol_max  = conteiner.vol_max
@@ -115,6 +122,7 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: 
     # (num_itens + 1) garante que qualquer ganho de 1 cm³ supere qualquer diferença
     # de contagem. A física (apoio mínimo / não-sobreposição) NÃO entra aqui — só
     # capacidade; quem valida fisicamente e define o que realmente cabe é a fase 1.5.
+    _prog("Fase 1 de 3 — selecionando itens e montando o empacotamento inicial")
     m1   = cp_model.CpModel()
     rest = {i: m1.new_bool_var(f'r_{i}') for i in nomes_itens}
 
@@ -164,6 +172,7 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: 
     # (itens posicionados → colocado=1; o resto → colocado=0), então o solver só
     # pode melhorar a contagem. `selecao` ⊇ `posicoes`, então pode recuperar os
     # itens que o guloso não conseguiu encaixar.
+    _prog(f"Fase 2 de 3 — otimizando o carregamento (CP-SAT, até {tempo_fase2:.0f} s; a mais longa)")
     itens2 = selecao
     m2 = cp_model.CpModel()
     xi, yi, zi = {}, {}, {}
@@ -285,6 +294,7 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: 
               f"— aumentar o tempo pode encaixar mais itens.")
 
     # ═══ FASE 3 — Compactar (eliminar vãos) + reinserir sobras ════════════════
+    _prog("Fase 3 de 3 — compactando os vãos e reinserindo sobras (até 30 s)")
     final_pos = _compactar_e_reinserir(
         carregar, pos2, itens_dados, nomes_itens,
         C_cx, C_cy, C_cz, min(30.0, tempo_fase2),
