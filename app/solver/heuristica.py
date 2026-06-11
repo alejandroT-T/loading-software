@@ -7,7 +7,7 @@ base por um único item imediatamente abaixo. Itens sem posição válida ficam 
 Testa um portfólio de ordenações (first-fit) e de estratégias torre-primeiro,
 devolvendo a que posiciona mais itens (volume como desempate).
 """
-from app.solver.restricoes import APOIO_MIN_PCT, LIMITE_PESADO_G
+from app.solver.restricoes import APOIO_MIN_PCT, LIMITE_PESADO_G, EMPILHA_MAX, apoio_permitido
 
 
 def _sobrepoe(p: dict, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> bool:
@@ -16,17 +16,54 @@ def _sobrepoe(p: dict, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> 
                 or z2 <= p["z1"] or z1 >= p["z2"])
 
 
-def _apoio_ok(colocados: list, x1: int, y1: int, z1: int, dx: int, dy: int) -> bool:
-    """Chão, ou um único item com topo em z1 cobrindo >= APOIO_MIN_PCT% da base em cada eixo."""
+def _nivel_pilha(colocados: list, itens_dados: dict, p: dict) -> int:
+    """Altura da pilha de itens do MESMO tipo_caixa que termina em `p` (>= 1):
+    desce pelos apoios (mesma regra de cobertura do solver) enquanto o item de
+    baixo for do mesmo tipo."""
+    t = itens_dados[p["nome"]].get("tipo_caixa")
+    nivel, atual = 1, p
+    while atual["z1"] > 0:
+        dx, dy = atual["x2"] - atual["x1"], atual["y2"] - atual["y1"]
+        sup = None
+        for q in colocados:
+            if q is atual or q["z2"] != atual["z1"]:
+                continue
+            ovx = min(q["x2"], atual["x2"]) - max(q["x1"], atual["x1"])
+            ovy = min(q["y2"], atual["y2"]) - max(q["y1"], atual["y1"])
+            if 100 * ovx >= APOIO_MIN_PCT * dx and 100 * ovy >= APOIO_MIN_PCT * dy:
+                sup = q
+                if itens_dados[q["nome"]].get("tipo_caixa") == t:
+                    break  # prefere o apoio do mesmo tipo (segue a pilha)
+        if sup is None or itens_dados[sup["nome"]].get("tipo_caixa") != t:
+            break
+        nivel += 1
+        atual = sup
+    return nivel
+
+
+def _apoio_ok(colocados: list, itens_dados: dict, item: str,
+              x1: int, y1: int, z1: int, dx: int, dy: int) -> bool:
+    """Chão, ou um único item com topo em z1 cobrindo >= APOIO_MIN_PCT% da base
+    em cada eixo — respeitando as regras de empilhamento por tipo_caixa
+    (`apoio_permitido`) e o limite de pilha do mesmo tipo (`EMPILHA_MAX`)."""
     if z1 == 0:
         return True
+    dim = itens_dados[item]
+    t = dim.get("tipo_caixa")
     for p in colocados:
         if p["z2"] != z1:
             continue
         ovx = min(p["x2"], x1 + dx) - max(p["x1"], x1)
         ovy = min(p["y2"], y1 + dy) - max(p["y1"], y1)
-        if 100 * ovx >= APOIO_MIN_PCT * dx and 100 * ovy >= APOIO_MIN_PCT * dy:
-            return True
+        if 100 * ovx < APOIO_MIN_PCT * dx or 100 * ovy < APOIO_MIN_PCT * dy:
+            continue
+        db = itens_dados[p["nome"]]
+        if not apoio_permitido(dim, db):
+            continue
+        if (t in EMPILHA_MAX and db.get("tipo_caixa") == t
+                and _nivel_pilha(colocados, itens_dados, p) + 1 > EMPILHA_MAX[t]):
+            continue
+        return True
     return False
 
 
@@ -56,7 +93,7 @@ def _tentar_colocar(item: str, itens_dados: dict, colocados: list, posicoes: dic
                     x2, y2, z2 = cx0 + dx, cy0 + dy, cz0 + dim["z"]
                     if any(_sobrepoe(p, cx0, cy0, cz0, x2, y2, z2) for p in colocados):
                         continue
-                    if not _apoio_ok(colocados, cx0, cy0, cz0, dx, dy):
+                    if not _apoio_ok(colocados, itens_dados, item, cx0, cy0, cz0, dx, dy):
                         continue
                     achou = (cx0, cy0, cz0)
                     break
@@ -104,6 +141,8 @@ def _montar_torres(carregar: list, itens_dados: dict, C_cz: int) -> list:
         d = itens_dados[base]
         torre = [(base, d["x"], d["y"])]
         h, topo_dx, topo_dy = d["z"], d["x"], d["y"]
+        topo = base       # item no topo da torre (regras de tipo valem contra ele)
+        nivel_topo = 1    # altura da pilha do mesmo tipo terminando no topo
         while True:
             achou = None
             for i in restantes:
@@ -112,19 +151,29 @@ def _montar_torres(carregar: list, itens_dados: dict, C_cz: int) -> list:
                 di = itens_dados[i]
                 if h + di["z"] > C_cz:
                     continue
+                dtopo = itens_dados[topo]
+                if not apoio_permitido(di, dtopo):
+                    continue
+                mesmo_tipo = (di.get("tipo_caixa") is not None
+                              and di.get("tipo_caixa") == dtopo.get("tipo_caixa"))
+                if (di.get("tipo_caixa") in EMPILHA_MAX and mesmo_tipo
+                        and nivel_topo + 1 > EMPILHA_MAX[di["tipo_caixa"]]):
+                    continue
                 if di["x"] <= topo_dx and di["y"] <= topo_dy:
-                    achou = (i, di["x"], di["y"])
+                    achou = (i, di["x"], di["y"], mesmo_tipo)
                     break
                 if di["y"] <= topo_dx and di["x"] <= topo_dy:
-                    achou = (i, di["y"], di["x"])
+                    achou = (i, di["y"], di["x"], mesmo_tipo)
                     break
             if achou is None:
                 break
-            i, dx, dy = achou
+            i, dx, dy, mesmo_tipo = achou
             torre.append((i, dx, dy))
             usados.add(i)
             h += itens_dados[i]["z"]
             topo_dx, topo_dy = dx, dy
+            topo = i
+            nivel_topo = nivel_topo + 1 if mesmo_tipo else 1
         torres.append(torre)
     return torres
 

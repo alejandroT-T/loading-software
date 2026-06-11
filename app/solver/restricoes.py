@@ -7,6 +7,32 @@ LIMITE_PESADO_G = 80_000  # 80 kg
 # 100*ov >= APOIO_MIN_PCT*dd para manter a aritmética inteira do CP-SAT)
 APOIO_MIN_PCT = 75
 
+# ── Regras de empilhamento por tipo_caixa (coluna da planilha) ───────────────
+# caixa_papelao: em cima dela só outra caixa de papelão IGUAL em tamanho e de
+#                peso menor/igual (a mais pesada fica embaixo); pilha de
+#                papelão limitada a 3 caixas.
+# malha:         em cima dela só outra malha; pilha de malhas limitada a 3.
+# caixa_madeira / sem tipo: sem regra extra — vale apenas o apoio mínimo normal.
+EMPILHA_MAX = {"caixa_papelao": 3, "malha": 3}  # altura máx. da pilha do mesmo tipo
+
+
+def _mesmo_tamanho(da: dict, db: dict) -> bool:
+    """Mesmas dimensões (footprint comparado a menos do giro X↔Y)."""
+    return (da["z"] == db["z"]
+            and sorted((da["x"], da["y"])) == sorted((db["x"], db["y"])))
+
+
+def apoio_permitido(dim_cima: dict, dim_baixo: dict) -> bool:
+    """Regras por tipo_caixa para `cima` apoiar DIRETAMENTE sobre `baixo`."""
+    tipo_baixo = dim_baixo.get("tipo_caixa")
+    if tipo_baixo == "caixa_papelao":
+        return (dim_cima.get("tipo_caixa") == "caixa_papelao"
+                and _mesmo_tamanho(dim_cima, dim_baixo)
+                and dim_cima["peso"] <= dim_baixo["peso"])
+    if tipo_baixo == "malha":
+        return dim_cima.get("tipo_caixa") == "malha"
+    return True
+
 
 def restricao_pesados_no_chao(
     model: cp_model.CpModel,
@@ -74,13 +100,27 @@ def restricao_apoio(
     livres e itens poderiam flutuar.
 
     `itens_dados` (opcional) habilita a poda de pares impossíveis: pares onde
-    `a` nunca alcançaria `APOIO_MIN_PCT`% da base de `b` não geram variáveis.
+    `a` nunca alcançaria `APOIO_MIN_PCT`% da base de `b` não geram variáveis —
+    e também as REGRAS POR TIPO de caixa: pares proibidos por `apoio_permitido`
+    não geram variáveis, e pilhas do mesmo tipo restrito (papelão, malha) são
+    limitadas a `EMPILHA_MAX` itens via IntVars de nível encadeadas
+    (`nivel[b] == nivel[a] + 1` quando `a` suporta `b` e ambos são do mesmo tipo;
+    o domínio 1..max torna pilhas maiores inviáveis).
 
     `colocado` (opcional) habilita a colocação opcional: a exigência de apoio só
     vale para itens colocados (`add_bool_or(...).only_enforce_if(colocado[b])`) e
     um item só pode apoiar outro se ele próprio estiver colocado.
     """
     n = len(carregar)
+
+    # Nível na pilha do mesmo tipo restrito (1 = base da pilha)
+    nivel: dict = {}
+    if itens_dados is not None:
+        for item in carregar:
+            t = itens_dados[item].get("tipo_caixa")
+            if t in EMPILHA_MAX:
+                nivel[item] = model.new_int_var(1, EMPILHA_MAX[t], f'nivel_{item}')
+
     for jj in range(n):
         b = carregar[jj]
         apoios = []
@@ -96,10 +136,17 @@ def restricao_apoio(
                 continue
             a = carregar[ii]
 
-            if itens_dados is not None and not _pode_apoiar(itens_dados[a], itens_dados[b]):
+            if itens_dados is not None and (
+                    not _pode_apoiar(itens_dados[a], itens_dados[b])
+                    or not apoio_permitido(itens_dados[b], itens_dados[a])):
                 continue
 
             suporte = model.new_bool_var(f'sob_{ii}_{jj}')
+
+            # Pilha do mesmo tipo restrito: empilhar incrementa o nível
+            if (b in nivel and a in nivel
+                    and itens_dados[a]["tipo_caixa"] == itens_dados[b]["tipo_caixa"]):
+                model.add(nivel[b] == nivel[a] + 1).only_enforce_if(suporte)
             # `a` imediatamente abaixo de `b` (topo de `a` no nível da base de `b`)
             model.add(zf[a] == zi[b]).only_enforce_if(suporte)
 

@@ -27,7 +27,7 @@ app/
 ├── main.py                  # orquestra: carregar_itens → resolver_carregamento → visualizar_carregamento
 ├── data/
 │   ├── conteiners.py        # dataclass Conteiner + CONTEINERES (4 padrão) + conteiner_personalizado()
-│   └── modelos.py           # carregar_itens(xlsx) → dict {nome: {x,y,z,peso,volume}}
+│   └── modelos.py           # carregar_itens(xlsx) → dict {nome: {x,y,z,peso,volume,pes,corpo_z}}
 ├── solver/
 │   ├── solver.py            # resolver_carregamento(): pipeline em 3 fases
 │   ├── heuristica.py        # empacotamento_guloso(): warm start da fase 2
@@ -49,7 +49,7 @@ app/
 - Capacidade peso/volume contando só itens colocados (`sum(colocado·peso) ≤ peso_max`, idem volume)
 - Se o volume selecionado ≤ metade do contêiner, restringe à metade traseira (`xf ≤ cx/2`, só se colocado)
 - `restricao_pesados_no_chao` — **suave**: itens > 80 kg (`LIMITE_PESADO_G = 80_000` g) preferem o chão (`zi == 0`); cada violação adiciona `C_cz` ao objetivo
-- `restricao_apoio(..., colocado=colocado)` — **dura**: todo item **colocado** está no chão OU apoiado por um único item (também colocado) imediatamente abaixo (`zf[a] == zi[b]`) cobrindo **≥ `APOIO_MIN_PCT`%** da base (hoje 75%) em cada eixo. `add_bool_or(...).only_enforce_if(colocado[b])`; `add_implication(suporte, colocado[a/b])`. `_pode_apoiar` poda pares impossíveis
+- `restricao_apoio(..., colocado=colocado)` — **dura**: todo item **colocado** está no chão OU apoiado por um único item (também colocado) imediatamente abaixo (`zf[a] == zi[b]`) cobrindo **≥ `APOIO_MIN_PCT`%** da base (hoje 75%) em cada eixo. `add_bool_or(...).only_enforce_if(colocado[b])`; `add_implication(suporte, colocado[a/b])`. `_pode_apoiar` poda pares impossíveis. **Regras por `tipo_caixa`** (jun/2026, dentro de `restricao_apoio` quando `itens_dados` é passado): `apoio_permitido(cima, baixo)` poda pares proibidos — sobre **`caixa_papelao`** só outro papelão **igual em tamanho** (`_mesmo_tamanho`: mesmo z + footprint a menos do giro) **e de peso ≤** (a mais pesada embaixo); sobre **`malha`** só outra malha; **`caixa_madeira`/sem tipo: livre** (só o apoio normal). Pilhas do mesmo tipo restrito são limitadas por `EMPILHA_MAX` (papelão 3, malha 3) via IntVars `nivel` (domínio 1..max) encadeadas `nivel[b] == nivel[a]+1` quando `suporte` — pilha de 4 fica inviável. A heurística (`_apoio_ok`, `_montar_torres`) aplica as mesmas regras (`_nivel_pilha` calcula a altura da pilha do mesmo tipo descendo pelos apoios), e `verificar_solucao.py` audita apoio permitido + pilha máx.
 - `restricao_nao_sobreposicao(..., colocado=colocado)` — disjunção de 6 separadores por par, exigida só quando **ambos** colocados
 
 Objetivo **lexicográfico**: `Maximize(W_ITEM·Σcolocado − x_max − penalidade_pesados)` com `W_ITEM = C_cx + C_cz·n_pesados + 1` (a contagem domina). Primeiro maximiza o nº de itens; entre soluções de mesma contagem, compacta ao fundo (X = 0) e prefere pesados no chão. Após resolver, `carregar` é recomputado a partir de `colocado`. Tempo `tempo_fase2` **travado em 180s** (jun/2026): a UI mostra o campo como readonly e o `/api/solve` ignora o valor recebido, forçando 180. `s2` usa `random_seed=1` e imprime se a solução é OPTIMAL (ótimo provado) ou só a melhor no tempo. A busca é não-determinística (8 workers + corte por tempo) → mesma entrada pode variar de contagem entre execuções; mais tempo encaixa mais itens (as corridas curtas ficam subotimizadas).
@@ -69,7 +69,9 @@ O CP-SAT exige inteiros; tudo é convertido na leitura (`modelos.py`):
 
 ### Dados de entrada (`data_load/`)
 
-Planilha ativa definida em `app/main.py` (`CAMINHO_XLSX`, hoje `data_items_1.xlsx`; também usada por `verificar_solucao.py`). Colunas: `ITEM`, `qtd` (opcional), `peso` (kg), `comprimento` (X), `profundidade` (Y), `altura` (Z), `volume`. Com coluna `qtd`, cada linha expande em N cópias `nome_1..nome_N`; sem ela, duplicatas ganham sufixo `_2`, `_3`, ….
+Planilha ativa definida em `app/main.py` (`CAMINHO_XLSX`, hoje `data_items_1.xlsx`; também usada por `verificar_solucao.py`). Colunas: `ITEM`, `qtd` (opcional), `peso` (kg), `comprimento` (X), `profundidade` (Y), `altura` (Z), `volume`, `tipo_caixa` (opcional: `malha` | `caixa_papelao` | `caixa_madeira`). Com coluna `qtd`, cada linha expande em N cópias `nome_1..nome_N`; sem ela, duplicatas ganham sufixo `_2`, `_3`, ….
+
+**Pés das caixas** (`modelos.py`, jun/2026): **somente itens com `tipo_caixa == "caixa_madeira"`** (`TIPO_COM_PES`) ganham **3 pés** sob o corpo — extremidades + centro do comprimento (X) —, cada um com `PE_LARGURA_CM` (15 cm) de largura, cobrindo toda a profundidade (Y) e com `PE_ALTURA_CM` (12 cm) de altura, deixando dois vãos livres entre eles. Na madeira a altura da planilha **já inclui os pés**: `corpo_z = z − 12` e o envelope `z` segue igual ao da planilha. `malha`/`caixa_papelao` (e planilha **sem** a coluna, avisado no console) ficam maciças com a altura original (`pes = None`, `corpo_z = z`). Formato: `pes = {altura, largura, posicoes_x: [0, (x−15)//2, x−15]}` (relativo à origem da caixa) ou `None`; madeira em que os pés não cabem (x < 45 cm ou z ≤ 12 cm) segue maciça, reportada no console. O dict também carrega `tipo_caixa` (normalizado lower/strip ou `None`). **O solver e a heurística continuam tratando cada item pelo envelope** (`x/y/z`) — apoio e não-sobreposição não enxergam os vãos (decisão de produto: o vão é só visual); `pes`/`corpo_z` alimentam a visualização do front.
 
 ### Contêineres (`app/data/conteiners.py`)
 
