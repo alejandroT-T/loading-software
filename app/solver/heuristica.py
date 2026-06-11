@@ -4,7 +4,8 @@ Posiciona itens um a um (chão primeiro, fundo primeiro) respeitando as mesmas
 regras da fase 2 do solver: não-sobreposição e apoio de >= APOIO_MIN_PCT% da
 base por um único item imediatamente abaixo. Itens sem posição válida ficam de fora.
 
-Testa um portfólio de ordenações e devolve a que carrega mais volume.
+Testa um portfólio de ordenações (first-fit) e de estratégias torre-primeiro,
+devolvendo a que posiciona mais itens (volume como desempate).
 """
 from app.solver.restricoes import APOIO_MIN_PCT, LIMITE_PESADO_G
 
@@ -81,6 +82,112 @@ def _tentar_colocar(item: str, itens_dados: dict, colocados: list, posicoes: dic
     return True
 
 
+def _montar_torres(carregar: list, itens_dados: dict, C_cz: int) -> list:
+    """Agrupa itens em torres empilháveis sem balanço: cada item acima cabe
+    inteiro no footprint do item abaixo (giro permitido) → apoio de 100%.
+
+    Bases maiores (peso como desempate) viram fundo de torre; sobre cada topo
+    entra o maior item que couber, enquanto a altura acumulada couber em C_cz.
+    Retorna lista de torres; cada torre é [(item, dx, dy), ...] do chão ao topo.
+    """
+    restantes = sorted(
+        carregar,
+        key=lambda i: (itens_dados[i]["x"] * itens_dados[i]["y"], itens_dados[i]["peso"]),
+        reverse=True,
+    )
+    usados: set = set()
+    torres = []
+    for base in restantes:
+        if base in usados:
+            continue
+        usados.add(base)
+        d = itens_dados[base]
+        torre = [(base, d["x"], d["y"])]
+        h, topo_dx, topo_dy = d["z"], d["x"], d["y"]
+        while True:
+            achou = None
+            for i in restantes:
+                if i in usados:
+                    continue
+                di = itens_dados[i]
+                if h + di["z"] > C_cz:
+                    continue
+                if di["x"] <= topo_dx and di["y"] <= topo_dy:
+                    achou = (i, di["x"], di["y"])
+                    break
+                if di["y"] <= topo_dx and di["x"] <= topo_dy:
+                    achou = (i, di["y"], di["x"])
+                    break
+            if achou is None:
+                break
+            i, dx, dy = achou
+            torre.append((i, dx, dy))
+            usados.add(i)
+            h += itens_dados[i]["z"]
+            topo_dx, topo_dy = dx, dy
+        torres.append(torre)
+    return torres
+
+
+def _empacotar_torres(torres: list, itens_dados: dict,
+                      C_cx: int, C_cy: int, C_cz: int) -> tuple:
+    """Estratégia torre-primeiro: posiciona cada torre como uma coluna no chão
+    (first-fit fundo-primeiro, com giro da torre inteira). Itens de torres que
+    não couberem no chão entram nas passadas de reinserção, que também podem
+    aproveitar o topo das torres baixas."""
+    colocados, posicoes, fora = [], {}, []
+    for torre in torres:
+        _, bdx, bdy = torre[0]
+        xs = sorted({0} | {p["x1"] for p in colocados} | {p["x2"] for p in colocados})
+        ys = sorted({0} | {p["y1"] for p in colocados} | {p["y2"] for p in colocados})
+        achou = None
+        for girar in (False, True):
+            ddx, ddy = (bdy, bdx) if girar else (bdx, bdy)
+            if ddx > C_cx or ddy > C_cy:
+                continue
+            for cx0 in xs:
+                if cx0 + ddx > C_cx:
+                    continue
+                for cy0 in ys:
+                    if cy0 + ddy > C_cy:
+                        continue
+                    # Coluna inteira livre: como nenhum item da torre excede o
+                    # footprint do fundo, basta checar o prisma do fundo até o teto.
+                    if any(_sobrepoe(p, cx0, cy0, 0, cx0 + ddx, cy0 + ddy, C_cz)
+                           for p in colocados):
+                        continue
+                    achou = (cx0, cy0, girar)
+                    break
+                if achou:
+                    break
+            if achou:
+                break
+        if achou is None:
+            fora.extend(i for i, _, _ in torre)
+            continue
+        cx0, cy0, girar = achou
+        z = 0
+        for item, dx, dy in torre:
+            if girar:
+                dx, dy = dy, dx
+            d = itens_dados[item]
+            colocados.append({
+                "nome": item,
+                "x1": cx0, "y1": cy0, "z1": z,
+                "x2": cx0 + dx, "y2": cy0 + dy, "z2": z + d["z"],
+            })
+            posicoes[item] = {"x": cx0, "y": cy0, "z": z, "dx": dx, "dy": dy,
+                              "girado": (dx, dy) != (d["x"], d["y"])}
+            z += d["z"]
+    progrediu = True
+    while progrediu and fora:
+        restantes = [i for i in fora
+                     if not _tentar_colocar(i, itens_dados, colocados, posicoes, C_cx, C_cy, C_cz)]
+        progrediu = len(restantes) < len(fora)
+        fora = restantes
+    return posicoes, fora
+
+
 def _empacotar(ordem: list, itens_dados: dict, C_cx: int, C_cy: int, C_cz: int) -> tuple:
     """Guloso first-fit: posiciona cada item na ordem dada; quem não couber vai
     para `fora`. Depois, passadas de reinserção: superfícies criadas por itens
@@ -137,6 +244,24 @@ def empacotamento_guloso(carregar: list, itens_dados: dict,
     for chave in ordens:
         posicoes, fora = _empacotar(
             sorted(carregar, key=chave, reverse=True), itens_dados, C_cx, C_cy, C_cz
+        )
+        vol = sum(itens_dados[i]["volume"] for i in posicoes)
+        if (len(posicoes), vol) > melhor_score:
+            melhor_score, melhor_posicoes, melhor_fora = (len(posicoes), vol), posicoes, fora
+
+    # Estratégia torre-primeiro: essencial quando a soma das bases excede muito
+    # o chão (carga baixa que exige 3+ camadas) — o first-fit chão-primeiro
+    # espalha as bases e desperdiça o espaço vertical nesses casos.
+    torres = _montar_torres(carregar, itens_dados, C_cz)
+    chaves_torre = (
+        lambda t: (sum(_d(i)["z"] for i, _, _ in t),),            # mais alta 1º
+        lambda t: (t[0][1] * t[0][2],),                           # maior base 1º
+        lambda t: (len(t), sum(_d(i)["volume"] for i, _, _ in t)),  # mais itens 1º
+        lambda t: (sum(_d(i)["volume"] for i, _, _ in t),),       # maior volume 1º
+    )
+    for chave in chaves_torre:
+        posicoes, fora = _empacotar_torres(
+            sorted(torres, key=chave, reverse=True), itens_dados, C_cx, C_cy, C_cz
         )
         vol = sum(itens_dados[i]["volume"] for i in posicoes)
         if (len(posicoes), vol) > melhor_score:
