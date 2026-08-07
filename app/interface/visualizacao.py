@@ -7,7 +7,8 @@ from app.data.conteiners import Conteiner
 def _bounds_caixa(item: dict, itens_dados: dict) -> tuple:
     x, y, z = item["st_x"], item["st_y"], item["st_z"]
     dx, dy  = item["dx"], item["dy"]
-    dz      = itens_dados[item["nome"]]["z"]
+    # Altura ORIENTADA (a caixa pode tombar); fallback ao envelope p/ entradas antigas
+    dz      = item.get("dz", itens_dados[item["nome"]]["z"])
     return (x, x + dx, y, y + dy, z, z + dz)
 
 

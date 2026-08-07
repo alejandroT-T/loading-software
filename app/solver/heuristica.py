@@ -8,6 +8,7 @@ Testa um portfólio de ordenações (first-fit) e de estratégias torre-primeiro
 devolvendo a que posiciona mais itens (volume como desempate).
 """
 from app.solver.restricoes import APOIO_MIN_PCT, LIMITE_PESADO_G, EMPILHA_MAX, apoio_permitido
+from app.solver.rotacao import orientacoes_distintas, indice_orientacao
 
 
 def _sobrepoe(p: dict, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> bool:
@@ -53,6 +54,11 @@ def _apoio_ok(colocados: list, itens_dados: dict, item: str,
     for p in colocados:
         if p["z2"] != z1:
             continue
+        p_dx, p_dy = p["x2"] - p["x1"], p["y2"] - p["y1"]
+        # Regra "base ≥ topo": o apoiador deve ser ≥ o item em ambos os eixos
+        # (item maior nunca fica sobre um menor; itens maiores são sempre a base).
+        if p_dx < dx or p_dy < dy:
+            continue
         ovx = min(p["x2"], x1 + dx) - max(p["x1"], x1)
         ovy = min(p["y2"], y1 + dy) - max(p["y1"], y1)
         if 100 * ovx < APOIO_MIN_PCT * dx or 100 * ovy < APOIO_MIN_PCT * dy:
@@ -77,12 +83,15 @@ def _tentar_colocar(item: str, itens_dados: dict, colocados: list, posicoes: dic
     xs = sorted({0} | {p["x1"] for p in colocados} | {p["x2"] for p in colocados})
     ys = sorted({0} | {p["y1"] for p in colocados} | {p["y2"] for p in colocados})
     melhor = None
-    for dx, dy, girado in ((dim["x"], dim["y"], False), (dim["y"], dim["x"], True)):
-        if dx > C_cx or dy > C_cy or dim["z"] > C_cz:
+    # Testa as orientações de giro (deduplicadas): cada uma dá um footprint
+    # (dx, dy) e uma altura (dz) próprios. Itens com livre_rotacao=False só usam
+    # as orientações "em pé" (sem tombar); os demais usam as 6.
+    for orient, dx, dy, dz, _perm in orientacoes_distintas(dim, dim.get("livre_rotacao", True)):
+        if dx > C_cx or dy > C_cy or dz > C_cz:
             continue
         achou = None
         for cz0 in zs:
-            if cz0 + dim["z"] > C_cz:
+            if cz0 + dz > C_cz:
                 continue
             for cx0 in xs:
                 if cx0 + dx > C_cx:
@@ -90,7 +99,7 @@ def _tentar_colocar(item: str, itens_dados: dict, colocados: list, posicoes: dic
                 for cy0 in ys:
                     if cy0 + dy > C_cy:
                         continue
-                    x2, y2, z2 = cx0 + dx, cy0 + dy, cz0 + dim["z"]
+                    x2, y2, z2 = cx0 + dx, cy0 + dy, cz0 + dz
                     if any(_sobrepoe(p, cx0, cy0, cz0, x2, y2, z2) for p in colocados):
                         continue
                     if not _apoio_ok(colocados, itens_dados, item, cx0, cy0, cz0, dx, dy):
@@ -106,16 +115,17 @@ def _tentar_colocar(item: str, itens_dados: dict, colocados: list, posicoes: dic
             pesado_alto = dim["peso"] > LIMITE_PESADO_G and cz0 > 0
             score = (pesado_alto, cz0, cx0 + dx, cy0)
             if melhor is None or score < melhor[0]:
-                melhor = (score, cx0, cy0, cz0, dx, dy, girado)
+                melhor = (score, cx0, cy0, cz0, dx, dy, dz, orient)
     if melhor is None:
         return False
-    _, cx0, cy0, cz0, dx, dy, girado = melhor
+    _, cx0, cy0, cz0, dx, dy, dz, orient = melhor
     colocados.append({
         "nome": item,
         "x1": cx0, "y1": cy0, "z1": cz0,
-        "x2": cx0 + dx, "y2": cy0 + dy, "z2": cz0 + dim["z"],
+        "x2": cx0 + dx, "y2": cy0 + dy, "z2": cz0 + dz,
     })
-    posicoes[item] = {"x": cx0, "y": cy0, "z": cz0, "dx": dx, "dy": dy, "girado": girado}
+    posicoes[item] = {"x": cx0, "y": cy0, "z": cz0,
+                      "dx": dx, "dy": dy, "dz": dz, "orient": orient}
     return True
 
 
@@ -225,8 +235,11 @@ def _empacotar_torres(torres: list, itens_dados: dict,
                 "x1": cx0, "y1": cy0, "z1": z,
                 "x2": cx0 + dx, "y2": cy0 + dy, "z2": z + d["z"],
             })
-            posicoes[item] = {"x": cx0, "y": cy0, "z": z, "dx": dx, "dy": dy,
-                              "girado": (dx, dy) != (d["x"], d["y"])}
+            # Torres ficam em pé (altura = z original); o giro, quando há, é só
+            # a troca X↔Y da coluna inteira → registra a orientação correspondente.
+            posicoes[item] = {"x": cx0, "y": cy0, "z": z,
+                              "dx": dx, "dy": dy, "dz": d["z"],
+                              "orient": indice_orientacao(d, dx, dy, d["z"])}
             z += d["z"]
     progrediu = True
     while progrediu and fora:
@@ -262,7 +275,8 @@ def empacotamento_guloso(carregar: list, itens_dados: dict,
     carregados (volume como desempate).
 
     Retorna `(posicoes, fora)`:
-    - posicoes: {item: {x, y, z, dx, dy, girado}} — solução viável (warm start)
+    - posicoes: {item: {x, y, z, dx, dy, dz, orient}} — solução viável (warm start);
+      `orient` é o índice da orientação de giro (rotacao.ORIENTACOES)
     - fora: itens sem posição válida (reportar como não carregados)
     """
     def _d(i):

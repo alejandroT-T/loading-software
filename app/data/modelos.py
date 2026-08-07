@@ -30,11 +30,28 @@ def _montar_pes(x: int, z: int) -> dict | None:
     }
 
 
+def _parse_livre_rotacao(v) -> bool:
+    """Converte a coluna `livre_rotacao` em booleano: sim/1/true → True (a caixa
+    pode tombar → 6 orientações); não/nao/0/false → False (só giro X↔Y, em pé).
+    Ausente/vazio → True (permissivo, mesmo default de quando não há a coluna)."""
+    if pd.isna(v):
+        return True
+    s = str(v).strip().lower()
+    if s in ("sim", "s", "1", "1.0", "true", "verdadeiro", "yes", "y"):
+        return True
+    if s in ("não", "nao", "n", "0", "0.0", "false", "falso", "no"):
+        return False
+    return True
+
+
 def carregar_itens(caminho_xlsx: Path) -> dict:
     df = pd.read_excel(caminho_xlsx)
     itens_dados = {}
     tem_qtd = "qtd" in df.columns
     tem_tipo = "tipo_caixa" in df.columns
+    # Coluna de liberdade de rotação (nome casado sem diferenciar maiúsc./espaços)
+    col_livre = next((c for c in df.columns
+                      if str(c).strip().lower() == "livre_rotacao"), None)
     contagem = {}  # usado apenas quando não há coluna qtd, para deduplicar nomes
     sem_pes = []   # caixas de madeira em que os pés não couberam (seguem maciças)
 
@@ -43,6 +60,7 @@ def carregar_itens(caminho_xlsx: Path) -> dict:
         qtd = int(row["qtd"]) if tem_qtd and pd.notna(row["qtd"]) else 1
         tipo = (str(row["tipo_caixa"]).strip().lower()
                 if tem_tipo and pd.notna(row["tipo_caixa"]) else None)
+        livre_rotacao = _parse_livre_rotacao(row[col_livre]) if col_livre else True
 
         x = int(row["comprimento"] * 100)
         y = int(row["profundidade"] * 100)
@@ -61,6 +79,7 @@ def carregar_itens(caminho_xlsx: Path) -> dict:
             "tipo_caixa": tipo,                               # malha | caixa_papelao | caixa_madeira | None
             "pes":    pes,                                    # None = caixa maciça
             "corpo_z": z - PE_ALTURA_CM if pes else z,        # altura só do corpo
+            "livre_rotacao": livre_rotacao,                   # True = pode tombar (6 orient.); False = só X↔Y
         }
 
         if qtd > 1:
@@ -87,5 +106,11 @@ def carregar_itens(caminho_xlsx: Path) -> dict:
     if sem_pes:
         print(f"⚠️ Pés não couberam em {len(sem_pes)} caixa(s) de madeira (seguem maciças): "
               + ", ".join(sem_pes))
+    if col_livre:
+        n_restritos = sum(1 for d in itens_dados.values() if not d["livre_rotacao"])
+        print(f"🔄 Rotação: {len(itens_dados) - n_restritos} item(ns) com giro livre (6 orientações) "
+              f"e {n_restritos} restrito(s) a giro no plano (X↔Y).")
+    else:
+        print("🔄 Sem coluna livre_rotacao: todos os itens com giro livre (6 orientações).")
 
     return itens_dados

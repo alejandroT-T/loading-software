@@ -4,3 +4,4 @@ __pycache__/
 *.pyo
 .backup/
 data_load/
+data_train/

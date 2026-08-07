@@ -17,9 +17,10 @@ EMPILHA_MAX = {"caixa_papelao": 3, "malha": 3}  # altura máx. da pilha do mesmo
 
 
 def _mesmo_tamanho(da: dict, db: dict) -> bool:
-    """Mesmas dimensões (footprint comparado a menos do giro X↔Y)."""
-    return (da["z"] == db["z"]
-            and sorted((da["x"], da["y"])) == sorted((db["x"], db["y"])))
+    """Caixas congruentes — mesmas três medidas, INDEPENDENTE da orientação.
+    Com o giro completo (6 orientações) uma caixa pode tombar, então o critério
+    de "mesmo tamanho" passa a comparar o conjunto das 3 dimensões ordenadas."""
+    return sorted((da["x"], da["y"], da["z"])) == sorted((db["x"], db["y"], db["z"]))
 
 
 def apoio_permitido(dim_cima: dict, dim_baixo: dict) -> bool:
@@ -60,15 +61,24 @@ def restricao_pesados_no_chao(
     return penalidades
 
 
+def _footprints(dim: dict) -> set:
+    """Os footprints (dx, dy) possíveis no chão considerando as 6 orientações de
+    giro — cada par ordenado de duas das três medidas (a terceira fica na vertical)."""
+    x, y, z = dim["x"], dim["y"], dim["z"]
+    return {(x, y), (y, x), (x, z), (z, x), (y, z), (z, y)}
+
+
 def _pode_apoiar(dim_a: dict, dim_b: dict) -> bool:
     """
     Poda: `a` só é candidato a apoiar `b` se em alguma combinação de rotações
-    a sobreposição máxima possível (limitada pelo menor dos dois) atingir
-    `APOIO_MIN_PCT`% da base de `b` em ambos os eixos. Evita criar variáveis
-    para pares fisicamente impossíveis (ex.: caixa pequena apoiando caixa grande).
+    (qualquer das 6 orientações de cada caixa) a sobreposição máxima possível
+    (limitada pelo menor dos dois) atingir `APOIO_MIN_PCT`% da base de `b` em
+    ambos os eixos. Evita criar variáveis para pares fisicamente impossíveis
+    (ex.: caixa pequena apoiando caixa grande). Mais orientações = poda mais
+    conservadora (nunca descarta um apoio que poderia existir).
     """
-    for ax, ay in ((dim_a["x"], dim_a["y"]), (dim_a["y"], dim_a["x"])):
-        for bx, by in ((dim_b["x"], dim_b["y"]), (dim_b["y"], dim_b["x"])):
+    for ax, ay in _footprints(dim_a):
+        for bx, by in _footprints(dim_b):
             if (100 * min(ax, bx) >= APOIO_MIN_PCT * bx
                     and 100 * min(ay, by) >= APOIO_MIN_PCT * by):
                 return True
@@ -166,6 +176,14 @@ def restricao_apoio(
 
             model.add(100 * ovx >= APOIO_MIN_PCT * ddx[b]).only_enforce_if(suporte)
             model.add(100 * ovy >= APOIO_MIN_PCT * ddy[b]).only_enforce_if(suporte)
+
+            # ── Regra "base ≥ topo" (jun/2026): item maior NÃO pode ficar apoiado
+            # sobre um menor. O footprint do apoiador `a` (já orientado) deve ser ≥
+            # o de `b` em ambos os eixos → a base é sempre maior ou igual ao item de
+            # cima. (Apoio CONJUNTO por 2+ caixas foi avaliado e NÃO implementado —
+            # sem ganho no dataset de teste e pesado no CP-SAT; ver CLAUDE.md.)
+            model.add(ddx[a] >= ddx[b]).only_enforce_if(suporte)
+            model.add(ddy[a] >= ddy[b]).only_enforce_if(suporte)
 
             # `a` só pode apoiar `b` se ambos estiverem colocados
             if colocado is not None:
