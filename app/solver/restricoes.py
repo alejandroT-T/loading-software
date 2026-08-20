@@ -1,11 +1,43 @@
+import contextvars
+
 from ortools.sat.python import cp_model
 
 # Limite em gramas (pesos são armazenados como kg * 1000)
 LIMITE_PESADO_G = 80_000  # 80 kg
 
 # Fração mínima da base que deve estar apoiada, em % (usada como
-# 100*ov >= APOIO_MIN_PCT*dd para manter a aritmética inteira do CP-SAT)
+# 100*ov >= pct*dd para manter a aritmética inteira do CP-SAT).
+# APOIO_MIN_PCT é o PADRÃO; o valor em vigor numa execução vem de
+# `apoio_min_pct()` e pode ser trocado por `definir_apoio_min_pct()`
+# (o front expõe isso no modo híbrido).
 APOIO_MIN_PCT = 75
+APOIO_MIN_PCT_MIN = 1    # limites aceitos (inteiros)
+APOIO_MIN_PCT_MAX = 100
+
+# Valor em vigor na execução atual. É um ContextVar (e não uma global mutável)
+# porque cada job do front roda o pipeline numa THREAD própria: um contexto novo
+# começa no padrão e só enxerga o que ele mesmo definiu, então duas execuções
+# simultâneas com percentuais diferentes não se atropelam.
+_APOIO_ATUAL = contextvars.ContextVar("apoio_min_pct", default=APOIO_MIN_PCT)
+
+
+def apoio_min_pct() -> int:
+    """% mínima da base que precisa estar apoiada, em vigor nesta execução."""
+    return _APOIO_ATUAL.get()
+
+
+def definir_apoio_min_pct(pct: int | None) -> int:
+    """Define o % de apoio desta execução (inteiro de `APOIO_MIN_PCT_MIN` a
+    `APOIO_MIN_PCT_MAX`); `None` volta ao padrão `APOIO_MIN_PCT`. Chamado no
+    início do pipeline (`resolver_carregamento`). Retorna o valor aplicado."""
+    valor = APOIO_MIN_PCT if pct is None else int(pct)
+    if not APOIO_MIN_PCT_MIN <= valor <= APOIO_MIN_PCT_MAX:
+        raise ValueError(
+            f"apoio_min_pct deve ser um inteiro de {APOIO_MIN_PCT_MIN} a "
+            f"{APOIO_MIN_PCT_MAX} (recebido: {pct!r})."
+        )
+    _APOIO_ATUAL.set(valor)
+    return valor
 
 # ── Regras de empilhamento por tipo_caixa (coluna da planilha) ───────────────
 # caixa_papelao: em cima dela só outra caixa de papelão IGUAL em tamanho e de
@@ -72,15 +104,16 @@ def _pode_apoiar(dim_a: dict, dim_b: dict) -> bool:
     """
     Poda: `a` só é candidato a apoiar `b` se em alguma combinação de rotações
     (qualquer das 6 orientações de cada caixa) a sobreposição máxima possível
-    (limitada pelo menor dos dois) atingir `APOIO_MIN_PCT`% da base de `b` em
+    (limitada pelo menor dos dois) atingir `apoio_min_pct()`% da base de `b` em
     ambos os eixos. Evita criar variáveis para pares fisicamente impossíveis
     (ex.: caixa pequena apoiando caixa grande). Mais orientações = poda mais
     conservadora (nunca descarta um apoio que poderia existir).
     """
+    pct = apoio_min_pct()
     for ax, ay in _footprints(dim_a):
         for bx, by in _footprints(dim_b):
-            if (100 * min(ax, bx) >= APOIO_MIN_PCT * bx
-                    and 100 * min(ay, by) >= APOIO_MIN_PCT * by):
+            if (100 * min(ax, bx) >= pct * bx
+                    and 100 * min(ay, by) >= pct * by):
                 return True
     return False
 
@@ -95,14 +128,16 @@ def restricao_apoio(
     C_cx: int, C_cy: int,
     itens_dados: dict | None = None,
     colocado: dict | None = None,
+    apoiadores_fixos: list | None = None,
+    nivel_fixo: dict | None = None,
 ) -> None:
     """
-    Restrição de apoio: `APOIO_MIN_PCT`% da base (face inferior) deve estar suportada.
+    Restrição de apoio: `apoio_min_pct()`% da base (face inferior) deve estar suportada.
 
     Todo item `b` deve estar no chão (`zi[b] == 0`) OU apoiado sobre um item
     `a` imediatamente abaixo (`zf[a] == zi[b]`) cuja sobreposição em XY cubra
-    pelo menos `APOIO_MIN_PCT`% da base de `b` em cada eixo
-    (100*ov >= APOIO_MIN_PCT*dd).
+    pelo menos `apoio_min_pct()`% da base de `b` em cada eixo
+    (100*ov >= pct*dd).
 
     Apenas a face inferior conta como apoio — contato lateral ou superior
     não sustenta o item. A disjunção `add_bool_or` obriga o solver a escolher
@@ -110,7 +145,7 @@ def restricao_apoio(
     livres e itens poderiam flutuar.
 
     `itens_dados` (opcional) habilita a poda de pares impossíveis: pares onde
-    `a` nunca alcançaria `APOIO_MIN_PCT`% da base de `b` não geram variáveis —
+    `a` nunca alcançaria `apoio_min_pct()`% da base de `b` não geram variáveis —
     e também as REGRAS POR TIPO de caixa: pares proibidos por `apoio_permitido`
     não geram variáveis, e pilhas do mesmo tipo restrito (papelão, malha) são
     limitadas a `EMPILHA_MAX` itens via IntVars de nível encadeadas
@@ -120,8 +155,18 @@ def restricao_apoio(
     `colocado` (opcional) habilita a colocação opcional: a exigência de apoio só
     vale para itens colocados (`add_bool_or(...).only_enforce_if(colocado[b])`) e
     um item só pode apoiar outro se ele próprio estiver colocado.
+
+    `apoiadores_fixos` (opcional, usado pelo LNS de `lns.py`): caixas que estão
+    PARADAS no layout e entram no modelo como constantes — cada uma vira mais
+    uma alternativa de apoio, com exatamente as mesmas regras (cobertura mínima,
+    base ≥ topo, `apoio_permitido`, limite de pilha). Formato por caixa:
+    `{"nome", "x1", "y1", "z1", "x2", "y2", "z2"}`. `nivel_fixo` traz a altura
+    ATUAL da pilha de cada uma (`{nome: nível}`), para que empilhar sobre elas
+    continue respeitando `EMPILHA_MAX`. Manter isto aqui — e não numa cópia
+    dentro do LNS — é o que garante que as duas rotas usem a MESMA física.
     """
     n = len(carregar)
+    pct = apoio_min_pct()   # % de apoio em vigor nesta execução
 
     # Nível na pilha do mesmo tipo restrito (1 = base da pilha)
     nivel: dict = {}
@@ -140,7 +185,7 @@ def restricao_apoio(
         model.add(zi[b] == 0).only_enforce_if(no_chao)
         apoios.append(no_chao)
 
-        # Alternativa 2: algum item `a` apoia a base de `b` em >= APOIO_MIN_PCT%
+        # Alternativa 2: algum item `a` apoia a base de `b` em >= pct%
         for ii in range(n):
             if ii == jj:
                 continue
@@ -174,8 +219,8 @@ def restricao_apoio(
             model.add_max_equality(Myi, [yi[a], yi[b]])
             model.add(ovy == myf - Myi)
 
-            model.add(100 * ovx >= APOIO_MIN_PCT * ddx[b]).only_enforce_if(suporte)
-            model.add(100 * ovy >= APOIO_MIN_PCT * ddy[b]).only_enforce_if(suporte)
+            model.add(100 * ovx >= pct * ddx[b]).only_enforce_if(suporte)
+            model.add(100 * ovy >= pct * ddy[b]).only_enforce_if(suporte)
 
             # ── Regra "base ≥ topo" (jun/2026): item maior NÃO pode ficar apoiado
             # sobre um menor. O footprint do apoiador `a` (já orientado) deve ser ≥
@@ -192,6 +237,48 @@ def restricao_apoio(
 
             apoios.append(suporte)
 
+        # Alternativa 3: apoio por uma caixa FIXA (obstáculo do LNS). Mesmas
+        # regras da alternativa 2, com o retângulo do apoiador como CONSTANTE.
+        for o in (apoiadores_fixos or []):
+            dim_o = itens_dados[o["nome"]] if itens_dados is not None else None
+            if dim_o is not None and not apoio_permitido(itens_dados[b], dim_o):
+                continue
+            t = dim_o.get("tipo_caixa") if dim_o is not None else None
+            nivel_o = (nivel_fixo or {}).get(o["nome"], 1)
+            if (t in EMPILHA_MAX and itens_dados is not None
+                    and itens_dados[b].get("tipo_caixa") == t
+                    and nivel_o + 1 > EMPILHA_MAX[t]):
+                continue
+
+            suporte = model.new_bool_var(f'sobfix_{o["nome"]}_{jj}')
+            model.add(zi[b] == o["z2"]).only_enforce_if(suporte)
+
+            mxf = model.new_int_var(0, C_cx,     f'fmxf_{o["nome"]}_{jj}')
+            Mxi = model.new_int_var(0, C_cx,     f'fMxi_{o["nome"]}_{jj}')
+            ovx = model.new_int_var(-C_cx, C_cx, f'fovx_{o["nome"]}_{jj}')
+            model.add_min_equality(mxf, [xf[b], o["x2"]])
+            model.add_max_equality(Mxi, [xi[b], o["x1"]])
+            model.add(ovx == mxf - Mxi)
+
+            myf = model.new_int_var(0, C_cy,     f'fmyf_{o["nome"]}_{jj}')
+            Myi = model.new_int_var(0, C_cy,     f'fMyi_{o["nome"]}_{jj}')
+            ovy = model.new_int_var(-C_cy, C_cy, f'fovy_{o["nome"]}_{jj}')
+            model.add_min_equality(myf, [yf[b], o["y2"]])
+            model.add_max_equality(Myi, [yi[b], o["y1"]])
+            model.add(ovy == myf - Myi)
+
+            model.add(100 * ovx >= pct * ddx[b]).only_enforce_if(suporte)
+            model.add(100 * ovy >= pct * ddy[b]).only_enforce_if(suporte)
+            # base ≥ topo: o footprint da caixa fixa deve cobrir o do item
+            model.add(o["x2"] - o["x1"] >= ddx[b]).only_enforce_if(suporte)
+            model.add(o["y2"] - o["y1"] >= ddy[b]).only_enforce_if(suporte)
+            # pilha do mesmo tipo restrito continua contando a partir do fixo
+            if b in nivel and t is not None and itens_dados[b].get("tipo_caixa") == t:
+                model.add(nivel[b] == nivel_o + 1).only_enforce_if(suporte)
+            if colocado is not None:
+                model.add_implication(suporte, colocado[b])
+            apoios.append(suporte)
+
         # `b` precisa de pelo menos uma alternativa de apoio válida (só se colocado)
         if colocado is not None:
             model.add_bool_or(apoios).only_enforce_if(colocado[b])
@@ -206,6 +293,7 @@ def restricao_nao_sobreposicao(
     yi: dict, yf: dict,
     zi: dict, zf: dict,
     colocado: dict | None = None,
+    fixos: list | None = None,
 ) -> None:
     """
     Não-sobreposição: dois itens não podem ocupar o mesmo espaço.
@@ -216,6 +304,10 @@ def restricao_nao_sobreposicao(
 
     `colocado` (opcional) habilita a colocação opcional: a separação só é exigida
     quando AMBOS os itens estão colocados.
+
+    `fixos` (opcional, LNS): caixas paradas no layout, como constantes
+    (`{"nome", "x1", ..., "z2"}`) — cada item do modelo precisa se separar delas
+    também. Sem variáveis novas para os obstáculos.
     """
     n = len(carregar)
     for ii in range(n):
@@ -230,5 +322,19 @@ def restricao_nao_sobreposicao(
             model.add(zi[a] >= zf[b]).only_enforce_if(s[5])
             if colocado is not None:
                 model.add_bool_or(s).only_enforce_if([colocado[a], colocado[b]])
+            else:
+                model.add_bool_or(s)
+
+    for oi, o in enumerate(fixos or []):
+        for jj, b in enumerate(carregar):
+            s = [model.new_bool_var(f'sepfix_{oi}_{jj}_{k}') for k in range(6)]
+            model.add(xf[b] <= o["x1"]).only_enforce_if(s[0])
+            model.add(xi[b] >= o["x2"]).only_enforce_if(s[1])
+            model.add(yf[b] <= o["y1"]).only_enforce_if(s[2])
+            model.add(yi[b] >= o["y2"]).only_enforce_if(s[3])
+            model.add(zf[b] <= o["z1"]).only_enforce_if(s[4])
+            model.add(zi[b] >= o["z2"]).only_enforce_if(s[5])
+            if colocado is not None:
+                model.add_bool_or(s).only_enforce_if(colocado[b])
             else:
                 model.add_bool_or(s)

@@ -1,9 +1,13 @@
+import time
+
 from ortools.sat.python import cp_model
 from app.data.conteiners import Conteiner
+from app.solver.cancelamento import checar as _checar, solver_cancelavel
 from app.solver.heuristica import empacotamento_guloso, _tentar_colocar
+from app.solver.lns import refinar_por_janelas
 from app.solver.rotacao import ORIENTACOES, dims as _dims_orient, rotulo_giro, orientacoes_permitidas
 from app.solver.restricoes import (
-    APOIO_MIN_PCT,
+    definir_apoio_min_pct,
     LIMITE_PESADO_G,
     restricao_pesados_no_chao,
     restricao_apoio,
@@ -16,6 +20,23 @@ from app.solver.restricoes import (
 # em 2·GAP por eixo e o layout final é deslocado +GAP — assim guloso, fase 2,
 # fase 3 e a reinserção respeitam a folga sem nenhuma restrição extra.
 GAP_PAREDE_CM = 2
+
+# Acima deste nº de itens a fase 2 MONOLÍTICA não entrega: medido (ago/2026) com
+# 138 itens → modelo de 171 mil vars, 180 s de busca e **+0 item** sobre o guloso.
+# Nesse regime a fase 2 passa a ser o LNS por janelas (`lns.py`), que resolve
+# muitos modelos pequenos no ótimo em vez de um grande em nenhum.
+LIMITE_FASE2_MONOLITICA = 80
+
+# Idem para a compactação da fase 3: com 106 itens o modelo (104 mil vars) não
+# convergiu em 30 s e devolveu o layout intacto; com 55 itens ela compacta ~3%
+# do Σ(x+y+z). Acima do limite, pula-se o CP-SAT e mantém-se só a reinserção.
+LIMITE_COMPACTACAO_ITENS = 80
+
+# Tempo de parede (s) para a REINSERÇÃO das sobras no fim da fase 3. Cada
+# tentativa é uma varredura completa da grade de candidatos (~n⁴ no pior caso) e
+# a maioria das sobras não entra — sem esse teto uma carga grande fica minutos
+# aqui, fora de qualquer limite de fase. O que não foi tentado vai para o console.
+ORCAMENTO_REINSERCAO_S = 20.0
 
 
 def _criar_vars_geometria(model, itens, itens_dados, C_cx, C_cy, C_cz):
@@ -59,6 +80,25 @@ def _criar_vars_geometria(model, itens, itens_dados, C_cx, C_cy, C_cz):
     return xi, yi, zi, xf, yf, zf, ddx, ddy, ddz, orient
 
 
+def _registrar(metricas: dict | None, **valores) -> None:
+    """Preenche o dict opcional de métricas do chamador (o `benchmark.py` usa
+    para medir QUANTO cada fase contribui: guloso × fase 2 × fase 3)."""
+    if metricas is not None:
+        metricas.update(valores)
+
+
+def _avanco(posicoes: dict) -> int:
+    """Ponta da carga no eixo X (cm) — quanto menor, mais compactada."""
+    return max((p["x"] + p["dx"] for p in posicoes.values()), default=0)
+
+
+def _soma_posicoes(posicoes: dict) -> int:
+    """Σ(x+y+z) de todas as caixas — é EXATAMENTE o que a fase 3 minimiza.
+    Medir isto (e não só o avanço) é o jeito justo de saber se a compactação
+    entregou alguma coisa."""
+    return sum(p["x"] + p["y"] + p["z"] for p in posicoes.values())
+
+
 def _ler_orientacao(solver, orient_item):
     """Índice (em ORIENTACOES) da orientação escolhida pelo solver p/ um item."""
     for k, o in enumerate(orient_item):
@@ -68,7 +108,7 @@ def _ler_orientacao(solver, orient_item):
 
 
 def _compactar_e_reinserir(carregar, pos_inicial, itens_dados, nomes_itens,
-                           C_cx, C_cy, C_cz, tempo):
+                           C_cx, C_cy, C_cz, tempo, cancelamento=None):
     """FASE 3 — com o conjunto de itens FIXO, reorganiza o contêiner para eliminar
     vãos (minimiza Σ das posições → empurra tudo ao canto fundo-esquerda-piso),
     mantendo apoio mínimo e não-sobreposição. Depois tenta reinserir, no espaço
@@ -77,6 +117,16 @@ def _compactar_e_reinserir(carregar, pos_inicial, itens_dados, nomes_itens,
     Retorna {item: {x, y, z, dx, dy, dz, orient}} com o layout final."""
     if not carregar:
         return dict(pos_inicial)
+
+    # Compactação CP-SAT só quando o modelo tem chance de convergir (ver
+    # LIMITE_COMPACTACAO_ITENS). Acima disso ela custa 20-30 s e devolve o layout
+    # intacto — a reinserção das sobras, que é gulosa e barata, continua valendo.
+    if len(carregar) > LIMITE_COMPACTACAO_ITENS:
+        print(f"⏭️  Fase 3: {len(carregar)} itens acima do limite de "
+              f"{LIMITE_COMPACTACAO_ITENS} — compactação CP-SAT pulada "
+              f"(não converge nesse tamanho); só a reinserção das sobras.")
+        return _reinserir_sobras(dict(pos_inicial), itens_dados, nomes_itens,
+                                 C_cx, C_cy, C_cz, cancelamento)
 
     m3 = cp_model.CpModel()
     xi, yi, zi, xf, yf, zf, ddx, ddy, ddz, orient = _criar_vars_geometria(
@@ -95,7 +145,11 @@ def _compactar_e_reinserir(carregar, pos_inicial, itens_dados, nomes_itens,
     s3.parameters.max_time_in_seconds = tempo
     s3.parameters.num_workers = 8
     s3.parameters.random_seed = 1
-    if s3.solve(m3) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+    _checar(cancelamento)
+    with solver_cancelavel(cancelamento, s3):
+        status3 = s3.solve(m3)
+    _checar(cancelamento)   # stop_search devolve FEASIBLE; o cancelamento vence
+    if status3 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("⚠️  Fase 3: compactação não convergiu — mantendo layout da fase 2.")
         return dict(pos_inicial)
 
@@ -107,7 +161,15 @@ def _compactar_e_reinserir(carregar, pos_inicial, itens_dados, nomes_itens,
     }
     print("🧱 Fase 3: layout compactado (vãos reduzidos).")
 
-    # Reinserção das sobras no layout compactado (menores primeiro: encaixam em vãos)
+    return _reinserir_sobras(final_pos, itens_dados, nomes_itens,
+                             C_cx, C_cy, C_cz, cancelamento)
+
+
+def _reinserir_sobras(final_pos: dict, itens_dados: dict, nomes_itens: list,
+                      C_cx: int, C_cy: int, C_cz: int, cancelamento=None) -> dict:
+    """Tenta encaixar, no layout dado, os itens que ficaram de fora (menores
+    primeiro: entram nos vãos). Guloso, determinístico e limitado por
+    `ORCAMENTO_REINSERCAO_S`; o que não foi testado vai para o console."""
     colocados = [
         {"nome": i, "x1": p["x"], "y1": p["y"], "z1": p["z"],
          "x2": p["x"] + p["dx"], "y2": p["y"] + p["dy"], "z2": p["z"] + p["dz"]}
@@ -116,98 +178,34 @@ def _compactar_e_reinserir(carregar, pos_inicial, itens_dados, nomes_itens,
     posicoes_novas: dict = {}
     sobras = sorted((i for i in nomes_itens if i not in final_pos),
                     key=lambda i: itens_dados[i]["volume"])
-    for i in sobras:
+    prazo_reinsercao = time.perf_counter() + ORCAMENTO_REINSERCAO_S
+    nao_tentados = 0
+    for pos, i in enumerate(sobras):
+        if time.perf_counter() > prazo_reinsercao:
+            nao_tentados = len(sobras) - pos
+            break
+        _checar(cancelamento)
         _tentar_colocar(i, itens_dados, colocados, posicoes_novas, C_cx, C_cy, C_cz)
     final_pos.update(posicoes_novas)
     if posicoes_novas:
         print(f"➕ Fase 3 reinseriu {len(posicoes_novas)} item(ns) no espaço liberado "
               f"→ {len(final_pos)} itens.")
+    if nao_tentados:
+        print(f"⏱️  Fase 3: orçamento de reinserção ({ORCAMENTO_REINSERCAO_S:.0f}s) esgotado — "
+              f"{nao_tentados} sobra(s) não chegaram a ser testadas.")
     return final_pos
 
 
-def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: float = 180.0,
-                          progresso=None) -> tuple:
-    """`tempo_fase2`: tempo (s) que a fase 2 (CP-SAT) tem para maximizar o nº de
-    itens e compactar. Mais tempo pode encaixar mais itens.
-    `progresso`: callback opcional `f(msg: str)` chamado no início de cada fase
-    (usado pelo front para mostrar o andamento; os prints continuam no console)."""
-    def _prog(msg):
-        if progresso:
-            progresso(msg)
+def _fase2_monolitica(selecao: list, itens_dados: dict, posicoes: dict,
+                      C_cx: int, C_cy: int, C_cz: int, peso_max: int, vol_max: int,
+                      restringir_ao_meio: bool, meio: int, tempo_fase2: float,
+                      cancelamento=None) -> tuple:
+    """FASE 2 clássica: UM modelo CP-SAT com todos os itens da seleção, cada um
+    com um booleano `colocado`. Devolve `(carregar, pos2)` ou `(None, None)` se a
+    busca não convergiu (aí o chamador cai no layout do guloso).
 
-    # Espaço útil = contêiner menos a folga das paredes (ver GAP_PAREDE_CM).
-    # Todas as fases trabalham nessas dimensões; o deslocamento +GAP volta no fim.
-    C_cx = max(conteiner.cx - 2 * GAP_PAREDE_CM, 0)
-    C_cy = max(conteiner.cy - 2 * GAP_PAREDE_CM, 0)
-    C_cz = conteiner.cz
-    peso_max = conteiner.peso_max
-    vol_max  = conteiner.vol_max
-    meio     = C_cx // 2
-
-    nomes_itens = list(itens_dados.keys())
-    num_itens   = len(nomes_itens)
-
-    # ═══ FASE 1 — Selecionar o MÁXIMO de VOLUME que cabe (peso/volume) ═════════
-    # Objetivo PRINCIPAL: maximizar o VOLUME selecionado; quantidade só como desempate.
-    # Peso lexicográfico: cada item soma 1 ao termo de contagem, então W_VOL =
-    # (num_itens + 1) garante que qualquer ganho de 1 cm³ supere qualquer diferença
-    # de contagem. A física (apoio mínimo / não-sobreposição) NÃO entra aqui — só
-    # capacidade; quem valida fisicamente e define o que realmente cabe é a fase 1.5.
-    _prog("Fase 1 de 3 — selecionando itens e montando o empacotamento inicial")
-    m1   = cp_model.CpModel()
-    rest = {i: m1.new_bool_var(f'r_{i}') for i in nomes_itens}
-
-    m1.add(sum(rest[i] * int(itens_dados[i]["peso"])   for i in nomes_itens) <= peso_max)
-    m1.add(sum(rest[i] * int(itens_dados[i]["volume"]) for i in nomes_itens) <= vol_max)
-    W_VOL = num_itens + 1  # garante prioridade absoluta do volume sobre a contagem
-    m1.maximize(
-        sum(rest[i] * int(itens_dados[i]["volume"]) * W_VOL for i in nomes_itens)
-        + sum(rest[i] for i in nomes_itens)
-    )
-
-    s1 = cp_model.CpSolver()
-    # Teto curto de propósito: a boa solução sai em segundos; o que demora é a
-    # PROVA de otimalidade (coeficientes de volume em cm³ são enormes) quando a
-    # capacidade é o gargalo (contêiner pequeno). FEASIBLE é aceito abaixo, então
-    # cortar a prova não muda o resultado prático — só evita ~300s de espera.
-    s1.parameters.max_time_in_seconds = 15.0
-    if s1.solve(m1) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print("❌ Fase 1: nenhuma solução viável.")
-        return None, None
-
-    selecao = [i for i in nomes_itens if s1.value(rest[i]) == 1]
-    vol_sel = sum(itens_dados[i]["volume"] for i in selecao)
-
-    # ═══ FASE 1.5 — Empacotar validando a física (apoio mínimo + não-sobrep.) ══
-    # O guloso testa um amplo portfólio de ordenações e devolve a que posiciona
-    # MAIS itens (volume como desempate) — é aqui que se maximiza, de fato, o nº de
-    # itens com física válida. Quem não couber sai e é reportado como não carregado.
-    # Serve também de warm start: sem ele o CP-SAT não acha a 1ª solução viável em
-    # tempo hábil.
-    restringir_ao_meio = vol_sel * 2 <= vol_max
-    x_limite = meio if restringir_ao_meio else C_cx
-    posicoes, fora_geometria = empacotamento_guloso(selecao, itens_dados, x_limite, C_cy, C_cz)
-    if not posicoes:
-        print("❌ Fase 1.5: heurística não posicionou nenhum item.")
-        return None, None
-    if fora_geometria:
-        print(f"⚠️  Fase 1.5: {len(fora_geometria)} de {len(selecao)} itens sem posição válida "
-              f"(sem espaço com apoio de {APOIO_MIN_PCT}%) — ficarão fora do carregamento.")
-    print(f"✅ Máximo de itens com física válida: {len(posicoes)}/{len(selecao)}")
-    carregar   = list(posicoes.keys())
-    vol_total  = sum(itens_dados[i]["volume"] for i in carregar)
-    peso_total = sum(itens_dados[i]["peso"]   for i in carregar)
-
-    # ═══ FASE 2 — Colocação OPCIONAL: maximizar nº de itens + compactar ═══════
-    # Diferente das fases anteriores: aqui o CP-SAT decide QUAIS itens entram.
-    # Cada item de `selecao` recebe um booleano `colocado`; as restrições físicas
-    # (apoio, não-sobreposição) só valem para itens colocados. O objetivo é
-    # lexicográfico — primeiro MAXIMIZAR a contagem de itens, depois compactar
-    # ao fundo (x_max) e manter pesados no chão. O guloso entra como warm start
-    # (itens posicionados → colocado=1; o resto → colocado=0), então o solver só
-    # pode melhorar a contagem. `selecao` ⊇ `posicoes`, então pode recuperar os
-    # itens que o guloso não conseguiu encaixar.
-    _prog(f"Fase 2 de 3 — otimizando o carregamento (CP-SAT, até {tempo_fase2:.0f} s; a mais longa)")
+    Funciona bem até algumas dezenas de itens; acima de `LIMITE_FASE2_MONOLITICA`
+    o modelo fica grande demais e quem assume é o LNS (`lns.refinar_por_janelas`)."""
     itens2 = selecao
     m2 = cp_model.CpModel()
     xi, yi, zi = {}, {}, {}
@@ -266,12 +264,15 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: 
     # ── Restrição suave: pesados (>80 kg) devem ficar no chão ────────────────
     penalidades_chao = restricao_pesados_no_chao(m2, itens2, itens_dados, zi)  # lista de (nome, chao_boolvar)
 
-    # ── Restrição de apoio: APOIO_MIN_PCT% da base, só para itens colocados ──
+    # ── Restrição de apoio: % de apoio em vigor, só para itens colocados ─────
     restricao_apoio(m2, itens2, xi, xf, yi, yf, zi, zf, ddx, ddy, C_cx, C_cy,
                     itens_dados=itens_dados, colocado=colocado)
 
     # ── Não-sobreposição (só entre pares de itens colocados) ─────────────────
     restricao_nao_sobreposicao(m2, itens2, xi, xf, yi, yf, zi, zf, colocado=colocado)
+    # NOTA (ago/2026): quebra de simetria MANUAL entre itens idênticos foi
+    # implementada e MEDIDA aqui — não mudou nada (ver CLAUDE.md). O presolve do
+    # CP-SAT já cuida disso; `symmetry_level=4` também não alterou o resultado.
 
     # Envelope da carga em cada eixo (só conta itens colocados). Minimizá-los no
     # objetivo empurra a carga contra o fundo (X=0), uma lateral (Y=0) e o piso
@@ -317,10 +318,12 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: 
     s2.parameters.max_time_in_seconds = tempo_fase2
     s2.parameters.num_workers = 8
     s2.parameters.random_seed = 1  # reprodutibilidade (não elimina variância do corte por tempo)
-    status2 = s2.solve(m2)
+    _checar(cancelamento)
+    with solver_cancelavel(cancelamento, s2):
+        status2 = s2.solve(m2)
+    _checar(cancelamento)   # stop_search devolve FEASIBLE; o cancelamento vence
 
     if status2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print("❌ Fase 2: não foi possível posicionar os itens.")
         return None, None
 
     # A fase 2 redefine quais itens entram (pode recuperar itens que o guloso descartou)
@@ -339,14 +342,156 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: 
     else:
         print(f"ℹ️  Fase 2: melhor solução em {tempo_fase2:.0f}s (não provada ótima) "
               f"— aumentar o tempo pode encaixar mais itens.")
+    return carregar, pos2
+
+
+def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: float = 180.0,
+                          progresso=None, apoio_min_pct: int | None = None,
+                          cancelamento=None, metricas: dict | None = None,
+                          lns: bool | None = None) -> tuple:
+    """`tempo_fase2`: tempo (s) que a fase 2 (CP-SAT) tem para maximizar o nº de
+    itens e compactar. Mais tempo pode encaixar mais itens.
+    `progresso`: callback opcional `f(msg: str)` chamado no início de cada fase
+    (usado pelo front para mostrar o andamento; os prints continuam no console).
+    `apoio_min_pct`: % mínima da base apoiada exigida de todo item elevado
+    (inteiro de 1 a 100; `None` = padrão `APOIO_MIN_PCT`, 75%). Vale para o
+    pipeline inteiro — guloso, fases 2/3 e reinserção. Percentuais menores
+    aceitam mais balanço (tende a caber mais item, com menos firmeza).
+    `cancelamento`: `Cancelamento` opcional (ver `app/solver/cancelamento.py`) —
+    o front passa um por job para o botão "Cancelar" abortar a execução; a
+    interrupção sai como `ExecucaoCancelada`.
+    `metricas`: dict opcional preenchido com a contribuição de cada fase
+    (`guloso`, `fase2`, `fase3` = nº de itens após cada uma; `avanco_fase2`,
+    `avanco_fase3` = ponta da carga em X, para medir a compactação). Usado pelo
+    `benchmark.py` — sem ele nada muda.
+    `lns`: força a rota da fase 2 — `True` = LNS por janelas, `False` = modelo
+    monolítico, `None` (padrão) = escolhe pelo tamanho da carga
+    (`LIMITE_FASE2_MONOLITICA`). Serve para o benchmark comparar as duas."""
+    def _prog(msg):
+        if progresso:
+            progresso(msg)
+
+    # % de apoio desta execução (thread do job): tudo abaixo — heurística e as
+    # restrições do CP-SAT — lê esse valor via `restricoes.apoio_min_pct()`.
+    pct_apoio = definir_apoio_min_pct(apoio_min_pct)
+
+    # Espaço útil = contêiner menos a folga das paredes (ver GAP_PAREDE_CM).
+    # Todas as fases trabalham nessas dimensões; o deslocamento +GAP volta no fim.
+    C_cx = max(conteiner.cx - 2 * GAP_PAREDE_CM, 0)
+    C_cy = max(conteiner.cy - 2 * GAP_PAREDE_CM, 0)
+    C_cz = conteiner.cz
+    peso_max = conteiner.peso_max
+    vol_max  = conteiner.vol_max
+    meio     = C_cx // 2
+
+    nomes_itens = list(itens_dados.keys())
+    num_itens   = len(nomes_itens)
+
+    # ═══ FASE 1 — Selecionar o MÁXIMO de VOLUME que cabe (peso/volume) ═════════
+    # Objetivo PRINCIPAL: maximizar o VOLUME selecionado; quantidade só como desempate.
+    # Peso lexicográfico: cada item soma 1 ao termo de contagem, então W_VOL =
+    # (num_itens + 1) garante que qualquer ganho de 1 cm³ supere qualquer diferença
+    # de contagem. A física (apoio mínimo / não-sobreposição) NÃO entra aqui — só
+    # capacidade; quem valida fisicamente e define o que realmente cabe é a fase 1.5.
+    print(f"🧷 Apoio mínimo de face exigido: {pct_apoio}% da base.")
+    _prog("Fase 1 de 3 — selecionando itens e montando o empacotamento inicial")
+    m1   = cp_model.CpModel()
+    rest = {i: m1.new_bool_var(f'r_{i}') for i in nomes_itens}
+
+    m1.add(sum(rest[i] * int(itens_dados[i]["peso"])   for i in nomes_itens) <= peso_max)
+    m1.add(sum(rest[i] * int(itens_dados[i]["volume"]) for i in nomes_itens) <= vol_max)
+    W_VOL = num_itens + 1  # garante prioridade absoluta do volume sobre a contagem
+    m1.maximize(
+        sum(rest[i] * int(itens_dados[i]["volume"]) * W_VOL for i in nomes_itens)
+        + sum(rest[i] for i in nomes_itens)
+    )
+
+    s1 = cp_model.CpSolver()
+    # Teto curto de propósito: a boa solução sai em segundos; o que demora é a
+    # PROVA de otimalidade (coeficientes de volume em cm³ são enormes) quando a
+    # capacidade é o gargalo (contêiner pequeno). FEASIBLE é aceito abaixo, então
+    # cortar a prova não muda o resultado prático — só evita ~300s de espera.
+    s1.parameters.max_time_in_seconds = 15.0
+    _checar(cancelamento)
+    with solver_cancelavel(cancelamento, s1):
+        status1 = s1.solve(m1)
+    _checar(cancelamento)
+    if status1 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print("❌ Fase 1: nenhuma solução viável.")
+        return None, None
+
+    selecao = [i for i in nomes_itens if s1.value(rest[i]) == 1]
+    vol_sel = sum(itens_dados[i]["volume"] for i in selecao)
+
+    # ═══ FASE 1.5 — Empacotar validando a física (apoio mínimo + não-sobrep.) ══
+    # O guloso testa um amplo portfólio de ordenações e devolve a que posiciona
+    # MAIS itens (volume como desempate) — é aqui que se maximiza, de fato, o nº de
+    # itens com física válida. Quem não couber sai e é reportado como não carregado.
+    # Serve também de warm start: sem ele o CP-SAT não acha a 1ª solução viável em
+    # tempo hábil.
+    restringir_ao_meio = vol_sel * 2 <= vol_max
+    x_limite = meio if restringir_ao_meio else C_cx
+    posicoes, fora_geometria = empacotamento_guloso(selecao, itens_dados, x_limite, C_cy, C_cz,
+                                                    cancelamento=cancelamento)
+    if not posicoes:
+        print("❌ Fase 1.5: heurística não posicionou nenhum item.")
+        return None, None
+    if fora_geometria:
+        print(f"⚠️  Fase 1.5: {len(fora_geometria)} de {len(selecao)} itens sem posição válida "
+              f"(sem espaço com apoio de {pct_apoio}%) — ficarão fora do carregamento.")
+    print(f"✅ Máximo de itens com física válida: {len(posicoes)}/{len(selecao)}")
+    _registrar(metricas, guloso=len(posicoes))
+    carregar   = list(posicoes.keys())
+    vol_total  = sum(itens_dados[i]["volume"] for i in carregar)
+    peso_total = sum(itens_dados[i]["peso"]   for i in carregar)
+
+    # ═══ FASE 2 — Colocação OPCIONAL: maximizar nº de itens + compactar ═══════
+    # Diferente das fases anteriores: aqui o CP-SAT decide QUAIS itens entram.
+    # Cada item de `selecao` recebe um booleano `colocado`; as restrições físicas
+    # (apoio, não-sobreposição) só valem para itens colocados. O objetivo é
+    # lexicográfico — primeiro MAXIMIZAR a contagem de itens, depois compactar
+    # ao fundo (x_max) e manter pesados no chão. O guloso entra como warm start
+    # (itens posicionados → colocado=1; o resto → colocado=0), então o solver só
+    # pode melhorar a contagem. `selecao` ⊇ `posicoes`, então pode recuperar os
+    # itens que o guloso não conseguiu encaixar.
+    usar_lns = (len(selecao) > LIMITE_FASE2_MONOLITICA) if lns is None else lns
+
+    if usar_lns:
+        # ── Rota LNS: muitos modelos pequenos resolvidos no ótimo ────────────
+        _prog(f"Fase 2 de 3 — refinando por janelas (LNS, até {tempo_fase2:.0f} s)")
+        print(f"🔁 Fase 2: {len(selecao)} itens — usando LNS por janelas no lugar do "
+              f"modelo monolítico (limite: {LIMITE_FASE2_MONOLITICA}).")
+        pos2, _sobras_lns, _resumo = refinar_por_janelas(
+            posicoes, [i for i in selecao if i not in posicoes], itens_dados,
+            x_limite, C_cy, C_cz, orcamento_s=tempo_fase2,
+            progresso=_prog, cancelamento=cancelamento)
+        carregar = list(pos2.keys())
+    else:
+        # ── Rota clássica: um modelo com todos os itens ──────────────────────
+        _prog(f"Fase 2 de 3 — otimizando o carregamento (CP-SAT, até {tempo_fase2:.0f} s; a mais longa)")
+        carregar, pos2 = _fase2_monolitica(
+            selecao, itens_dados, posicoes, C_cx, C_cy, C_cz, peso_max, vol_max,
+            restringir_ao_meio, meio, tempo_fase2, cancelamento)
+        if carregar is None:
+            # FALLBACK (ago/2026): a busca não convergiu. ANTES o pipeline devolvia
+            # (None, None) e o front mostrava "sem solução viável" — jogando fora um
+            # layout válido que o guloso já tinha (medido: 106 itens virando 0).
+            print(f"⚠️  Fase 2 não convergiu em {tempo_fase2:.0f}s — seguindo com o "
+                  f"layout do guloso ({len(posicoes)} itens), que é válido.")
+            carregar, pos2 = list(posicoes), dict(posicoes)
+
+    _registrar(metricas, fase2=len(carregar), avanco_fase2=_avanco(pos2),
+               soma_pos_fase2=_soma_posicoes(pos2))
 
     # ═══ FASE 3 — Compactar (eliminar vãos) + reinserir sobras ════════════════
     _prog("Fase 3 de 3 — compactando os vãos e reinserindo sobras (até 30 s)")
     final_pos = _compactar_e_reinserir(
         carregar, pos2, itens_dados, nomes_itens,
-        C_cx, C_cy, C_cz, min(30.0, tempo_fase2),
+        C_cx, C_cy, C_cz, min(30.0, tempo_fase2), cancelamento=cancelamento,
     )
     carregar = list(final_pos.keys())
+    _registrar(metricas, fase3=len(final_pos), avanco_fase3=_avanco(final_pos),
+               soma_pos_fase3=_soma_posicoes(final_pos))
 
     # Desloca o layout do espaço útil para o contêiner real: +GAP em X e Y
     # materializa a folga em relação às 4 paredes laterais.
@@ -418,7 +563,8 @@ def resolver_carregamento(conteiner: Conteiner, itens_dados: dict, tempo_fase2: 
 
 
 def resolver_multiplos_conteineres(conteineres, itens_dados, tempo_fase2: float = 180.0,
-                                   progresso=None) -> tuple:
+                                   progresso=None, apoio_min_pct: int | None = None,
+                                   cancelamento=None) -> tuple:
     """Distribui os itens entre VÁRIOS contêineres por preenchimento SEQUENCIAL:
     cada contêiner recebe o pipeline completo (`resolver_carregamento`) sobre os
     itens ainda não carregados; as sobras seguem para o próximo. Reaproveita 100%
@@ -433,6 +579,10 @@ def resolver_multiplos_conteineres(conteineres, itens_dados, tempo_fase2: float 
     ficariam de fora de um contêiner pequeno. Os resultados voltam na ORDEM
     ORIGINAL da lista (a do usuário/visualização).
     `progresso`: callback opcional `f(msg)` — recebe "Contêiner i de N — <fase>".
+    `apoio_min_pct`: % mínima de apoio da base (1 a 100; `None` = padrão 75%),
+    repassado igual a todos os contêineres.
+    `cancelamento`: `Cancelamento` opcional — checado entre contêineres e dentro
+    de cada pipeline (aborta com `ExecucaoCancelada`).
 
     Retorna `(resultados, nao_carregados)` onde
     `resultados = [(Conteiner, lista_carregamento), ...]` (um por contêiner, na
@@ -446,6 +596,7 @@ def resolver_multiplos_conteineres(conteineres, itens_dados, tempo_fase2: float 
     res_por_idx: dict = {}
 
     for passo, i in enumerate(ordem_fill, 1):
+        _checar(cancelamento)
         cont = conteineres[i]
         if not restantes:
             res_por_idx[i] = (cont, [])
@@ -461,7 +612,8 @@ def resolver_multiplos_conteineres(conteineres, itens_dados, tempo_fase2: float 
         print("#" * 65)
 
         lista, _ = resolver_carregamento(cont, restantes, tempo_fase2=tempo_fase2,
-                                         progresso=_prog)
+                                         progresso=_prog, apoio_min_pct=apoio_min_pct,
+                                         cancelamento=cancelamento)
         lista = lista or []
         res_por_idx[i] = (cont, lista)
 
